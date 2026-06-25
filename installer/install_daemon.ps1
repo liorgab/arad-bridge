@@ -127,7 +127,10 @@ $config = @{
 } | ConvertTo-Json -Depth 5
 
 # Write without BOM (Python's json.load rejects BOM)
-[System.IO.File]::WriteAllText($configPath, $config, [System.Text.UTF8Encoding]::new($false))
+# PS 5.1 + PS 7 compatible: encode to bytes, write bytes
+$encoding = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false)
+$bytes = $encoding.GetBytes([string]$config)
+[System.IO.File]::WriteAllBytes($configPath, $bytes)
 Write-Host "  [OK] config.json written" -ForegroundColor Green
 Write-Host "       Port: 8766 (separate from D.Yohai's 8765)" -ForegroundColor Gray
 Write-Host "       Profile: $profileDir (separate WA login)" -ForegroundColor Gray

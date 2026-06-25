@@ -1,0 +1,23 @@
+<Configuration>
+  <!-- Windows Sandbox config to test ARAD Bridge fresh-install from zero -->
+  <!-- Usage: double-click this file. Windows 10/11 Pro/Enterprise required. -->
+  <!-- Enable Windows Sandbox once: -->
+  <!--   Settings > Optional features > "Windows Sandbox" > Restart -->
+
+  <VGpu>Enable</VGpu>
+  <Networking>Default</Networking>
+  <MemoryInMB>4096</MemoryInMB>
+
+  <MappedFolders>
+    <!-- Mount the arad-bridge repo as read-write inside the sandbox -->
+    <MappedFolder>
+      <HostFolder>C:\claude\ARAD\arad-bridge</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\arad-bridge</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+
+  <LogonCommand>
+    <Command>cmd.exe /c start "" "C:\Users\WDAGUtilityAccount\Desktop\arad-bridge\install.bat"</Command>
+  </LogonCommand>
+</Configuration>
