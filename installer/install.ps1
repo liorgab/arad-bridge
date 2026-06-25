@@ -34,7 +34,12 @@ $ProgressPreference    = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 $OutputEncoding           = [System.Text.Encoding]::UTF8
 
 # ─── Constants ───────────────────────────────────────────────────────
-$REPO_ROOT     = $PSScriptRoot
+# install.ps1 lives inside installer/ — repo root is one level up
+$REPO_ROOT     = Split-Path -Parent $PSScriptRoot
+# Backwards-compat fallback: if invoked directly from repo root (no installer/ folder), use $PSScriptRoot
+if (-not (Test-Path (Join-Path $REPO_ROOT 'extension'))) {
+    $REPO_ROOT = $PSScriptRoot
+}
 $INSTALL_BASE  = "$env:LOCALAPPDATA\AradBridge"        # repo + scripts
 $DAEMON_BASE   = "$env:LOCALAPPDATA\AradBulkDaemon"    # daemon + chromedriver + profile
 $CFT_BASE      = "$env:LOCALAPPDATA\AradChromeTest"    # Chrome for Testing
