@@ -1,0 +1,50 @@
+{
+  "id": "piba",
+  "name": "PIBA — הנפקת ויזות",
+  "version": "1.0.0",
+  "description": "מנפיק אישורי שהייה ואישורי כניסה אוטומטית מאתר רשות האוכלוסין",
+  "category": "government",
+  "sku": "PIBA_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "https://inforhub.piba.gov.il/*"
+  ],
+  "content_scripts": [
+    {
+      "file": "modules/piba/content.js",
+      "matches": ["https://inforhub.piba.gov.il/*"],
+      "run_at": "document_idle"
+    }
+  ],
+  "handler": "modules/piba/handler.js",
+  "message_types": [
+    "PIBA_FETCH_VISA",
+    "PIBA_FETCH_INTER_VISA",
+    "OPEN_PIBA"
+  ],
+  "api_surface": [
+    {
+      "method": "fetchPibaVisa",
+      "description": "Fetches an Employer Visa PDF (requires 2FA token from PIBA login)",
+      "params": { "foreignKey": "string — '{country_numeric_code}_{passport_no}'" },
+      "returns": { "success": "boolean", "pdf_base64": "string?", "error_code": "string?", "error": "string?" }
+    },
+    {
+      "method": "fetchPibaInterVisa",
+      "description": "Fetches an Inter Visa PDF (no auth — public endpoint)",
+      "params": { "foreignKey": "string — '{country_numeric_code}_{passport_lowercase}'" },
+      "returns": { "success": "boolean", "pdf_base64": "string?", "error_code": "string?", "error": "string?" }
+    },
+    {
+      "method": "openPiba",
+      "description": "Opens the PIBA login page in a new tab (for 2FA setup)",
+      "params": {},
+      "returns": { "success": "boolean" }
+    }
+  ],
+  "storage_keys": [
+    "piba_token",
+    "piba_token_exp",
+    "piba_token_updated_at"
+  ]
+}

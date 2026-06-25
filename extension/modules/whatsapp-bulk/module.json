@@ -1,0 +1,31 @@
+{
+  "id": "whatsapp_bulk",
+  "name": "WhatsApp — שליחה המונית",
+  "version": "1.0.0",
+  "description": "שליחה מרוכזת של מאות הודעות עם השהיות אנטי-באן. דורש התקנת ARAD Bulk Daemon נפרד (פורט 8766).",
+  "category": "messaging",
+  "sku": "WA_BULK_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
+  ],
+  "content_scripts": [],
+  "handler": "modules/whatsapp-bulk/handler.js",
+  "message_types": [
+    "BULK_DAEMON_STATUS",
+    "BULK_OPEN_WHATSAPP",
+    "BULK_SEND_START",
+    "BULK_SEND_STOP",
+    "BULK_SEND_PAUSE",
+    "BULK_SEND_RESUME"
+  ],
+  "requires_external": {
+    "type": "daemon",
+    "name": "ARAD Bulk Daemon",
+    "port": 8766,
+    "check_url": "http://127.0.0.1:8766/status",
+    "download_url": "https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe",
+    "installer_size_mb": 250
+  }
+}

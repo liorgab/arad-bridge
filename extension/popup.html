@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>ARAD Bridge</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --surface: #f8fafc;
+      --surface-2: #f1f5f9;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --text-faint: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-light: #dbeafe;
+      --success: #10b981;
+      --success-light: #d1fae5;
+      --success-dark: #065f46;
+      --warning: #f59e0b;
+      --warning-light: #fef3c7;
+      --warning-dark: #92400e;
+      --danger: #ef4444;
+      --danger-light: #fee2e2;
+      --danger-dark: #991b1b;
+      --whatsapp-green: #25d366;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 420px;
+      min-height: 480px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Heebo", sans-serif;
+      font-size: 14px; line-height: 1.5;
+      color: var(--text);
+      background: var(--bg);
+    }
+    .header {
+      padding: 14px 20px;
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      color: #fff;
+    }
+    .header h1 { font-size: 17px; font-weight: 700; }
+    .header .version { font-size: 11px; opacity: 0.85; margin-top: 2px; }
+
+    .view { display: none; padding: 16px 20px; }
+    .view.active { display: block; }
+
+    .welcome-hero { text-align: center; padding: 16px 0 24px; }
+    .welcome-hero .emoji { font-size: 44px; margin-bottom: 10px; }
+    .welcome-hero h2 { font-size: 19px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+    .welcome-hero p { color: var(--text-muted); font-size: 13px; max-width: 320px; margin: 0 auto; }
+    .welcome-bullets {
+      list-style: none; margin: 14px 0 22px; padding: 14px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    }
+    .welcome-bullets li {
+      padding: 5px 0; font-size: 13px;
+      display: flex; align-items: flex-start; gap: 8px;
+    }
+    .welcome-bullets li:before {
+      content: "✓"; color: var(--success); font-weight: 700; font-size: 14px; flex-shrink: 0;
+    }
+
+    /* ─── Wizard ───────────────────────────────── */
+    .wizard-progress { display: flex; gap: 6px; margin-bottom: 14px; }
+    .wizard-step { flex: 1; height: 4px; background: var(--border); border-radius: 2px; }
+    .wizard-step.active { background: var(--accent); }
+    .wizard-step.done { background: var(--success); }
+    .section-title {
+      font-size: 11px; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 8px;
+    }
+
+    /* ─── Module card (D.Yohai style) ─────────── */
+    .module-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 10px;
+      background: var(--bg);
+    }
+    .module-card .module-title {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .health-pill {
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .health-pill .icon { font-size: 14px; flex-shrink: 0; line-height: 1.4; }
+    .health-pill .body { flex: 1; }
+    .health-pill .msg { font-weight: 600; }
+    .health-pill .hint { font-size: 11px; opacity: 0.9; margin-top: 2px; }
+    .health-pill.ok { background: var(--success-light); color: var(--success-dark); }
+    .health-pill.bad { background: var(--danger-light); color: var(--danger-dark); }
+    .health-pill.warn { background: var(--warning-light); color: var(--warning-dark); }
+    .health-pill.disabled { background: var(--surface-2); color: var(--text-muted); }
+
+    .action-btn {
+      width: 100%;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: none;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+    .action-btn.primary { background: var(--accent); color: #fff; }
+    .action-btn.primary:hover { background: var(--accent-hover); }
+    .action-btn.success { background: var(--whatsapp-green); color: #fff; }
+    .action-btn.success:hover { filter: brightness(0.95); }
+    .action-btn.gray { background: var(--text-muted); color: #fff; }
+    .action-btn.gray:hover { filter: brightness(0.95); }
+
+    /* ─── Wizard module list ──────────────────── */
+    .module-list { display: flex; flex-direction: column; gap: 8px; }
+    .module-row {
+      display: flex; align-items: flex-start; gap: 12px;
+      padding: 12px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; transition: all 0.15s;
+    }
+    .module-row.enabled { background: var(--bg); border-color: var(--accent); }
+    .module-info { flex: 1; min-width: 0; }
+    .module-name { font-weight: 600; font-size: 14px; margin-bottom: 2px; color: var(--text); }
+    .module-desc { font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+    .module-meta { margin-top: 4px; font-size: 10px; color: var(--text-faint); }
+
+    .toggle {
+      position: relative; width: 40px; height: 22px;
+      flex-shrink: 0; margin-top: 2px;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle .slider {
+      position: absolute; cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border-strong);
+      transition: 0.2s; border-radius: 22px;
+    }
+    .toggle .slider:before {
+      position: absolute; content: "";
+      height: 16px; width: 16px;
+      right: 3px; bottom: 3px;
+      background-color: #fff;
+      transition: 0.2s; border-radius: 50%;
+    }
+    .toggle input:checked + .slider { background-color: var(--accent); }
+    .toggle input:checked + .slider:before { transform: translateX(-18px); }
+
+    .btn-row { display: flex; gap: 8px; margin-top: 18px; }
+    .btn {
+      flex: 1; padding: 10px 16px;
+      border-radius: 8px; border: 1px solid var(--border-strong);
+      background: #fff; color: var(--text);
+      font-size: 13px; font-weight: 600;
+      cursor: pointer; font-family: inherit;
+    }
+    .btn:hover { background: var(--surface); }
+    .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn.primary:hover { background: var(--accent-hover); }
+
+    /* ─── Status header ───────────────────────── */
+    .top-status {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 14px;
+      font-size: 12px;
+    }
+    .top-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
+    .top-status .customer { color: var(--text-muted); margin-right: auto; }
+
+    .empty-state {
+      padding: 24px 16px; text-align: center;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; color: var(--text-muted); font-size: 13px;
+    }
+    .empty-state .hint { margin-top: 6px; font-size: 11px; }
+
+    .footer {
+      padding: 10px 20px; border-top: 1px solid var(--border);
+      font-size: 11px; color: var(--text-muted);
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--surface);
+    }
+    .footer a { color: var(--accent); text-decoration: none; cursor: pointer; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>ARAD Bridge</h1>
+    <div class="version">v2.0.0 — מודולרי</div>
+  </div>
+
+  <!-- VIEW: Welcome -->
+  <div id="view-welcome" class="view">
+    <div class="wizard-progress">
+      <div class="wizard-step active"></div>
+      <div class="wizard-step"></div>
+      <div class="wizard-step"></div>
+    </div>
+    <div class="welcome-hero">
+      <div class="emoji">🌉</div>
+      <h2>ברוכים הבאים ל-ARAD Bridge</h2>
+      <p>הגשר בין אפליקציית ARAD לבין שירותי PIBA, HopOn, WhatsApp ועוד</p>
+    </div>
+    <ul class="welcome-bullets">
+      <li>הנפקת ויזות אוטומטית מאתר רשות האוכלוסין</li>
+      <li>סנכרון tokens עם HopOn</li>
+      <li>שליחת הודעות WhatsApp יחידות והמוניות</li>
+      <li>מודולים נטענים רק לפי מה שהארגון שלך רכש</li>
+    </ul>
+    <div class="btn-row">
+      <button class="btn" data-action="skip-to-status">דלג</button>
+      <button class="btn primary" data-action="next-to-modules">המשך</button>
+    </div>
+  </div>
+
+  <!-- VIEW: Modules selection -->
+  <div id="view-modules" class="view">
+    <div class="wizard-progress">
+      <div class="wizard-step done"></div>
+      <div class="wizard-step active"></div>
+      <div class="wizard-step"></div>
+    </div>
+    <h2 style="margin-bottom: 4px;">בחירת מודולים</h2>
+    <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 14px;">
+      בחר אילו מודולים להפעיל. ניתן לשנות בכל עת.
+    </p>
+    <div id="modules-list" class="module-list"></div>
+    <div class="btn-row">
+      <button class="btn" data-action="back-to-welcome">אחורה</button>
+      <button class="btn primary" data-action="modules-to-status">שמור</button>
+    </div>
+  </div>
+
+  <!-- VIEW: Status (card-based, D.Yohai style) -->
+  <div id="view-status" class="view">
+    <div id="top-status" class="top-status">
+      <div class="dot"></div>
+      <div>ARAD Bridge פעיל (v2.0.0)</div>
+      <div id="customer-label" class="customer">ממתין ל-handshake</div>
+    </div>
+
+    <div id="health-cards"></div>
+  </div>
+
+  <div class="footer">
+    <a id="open-wizard">⚙ הגדרות מודולים</a>
+    <a id="refresh-health">🔄 רענן</a>
+  </div>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

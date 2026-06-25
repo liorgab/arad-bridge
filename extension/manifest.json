@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "ARAD Bridge",
+  "version": "2.0.0",
+  "description": "ARAD Bridge — Chrome Extension מודולרי למערכת ARAD לניהול עובדים זרים. תומך ב-PIBA, HopOn, WhatsApp Single ו-WhatsApp Bulk.",
+  "author": "Lior Gabay",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "activeTab",
+    "nativeMessaging"
+  ],
+
+  "host_permissions": [
+    "https://arad-admin.vercel.app/*",
+    "https://*.vercel.app/*",
+
+    "https://inforhub.piba.gov.il/*",
+
+    "https://b2b-dashboard.hopon.co/*",
+    "https://api-gateway.hopon.co/*",
+
+    "https://web.whatsapp.com/*",
+
+    "https://*.googleapis.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://storage.googleapis.com/*",
+
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["core/page-bridge.js"],
+      "matches": [
+        "https://arad-admin.vercel.app/*",
+        "https://*.vercel.app/*"
+      ]
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ARAD Bridge"
+  },
+
+  "icons": {
+    "16": "icons/16.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
+}

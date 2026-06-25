@@ -1,0 +1,38 @@
+{
+  "id": "whatsapp_single",
+  "name": "WhatsApp — שליחה יחידה",
+  "version": "1.0.0",
+  "description": "שליחת הודעה יחידה לעובד דרך הדפדפן הרגיל. תומך בהורדת קובץ והדבקה אוטומטית. לא מתאים לשליחה המונית.",
+  "category": "messaging",
+  "sku": "WA_SINGLE_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "https://web.whatsapp.com/*"
+  ],
+  "content_scripts": [
+    {
+      "file": "modules/whatsapp-single/content.js",
+      "matches": ["https://web.whatsapp.com/*"],
+      "run_at": "document_idle"
+    }
+  ],
+  "handler": "modules/whatsapp-single/handler.js",
+  "message_types": [
+    "WHATSAPP_OPEN_CHAT",
+    "WHATSAPP_AUTO_SEND",
+    "WHATSAPP_GET_STATUS",
+    "OPEN_WHATSAPP",
+    "NATIVE_PING",
+    "NATIVE_SAVE_FILE",
+    "NATIVE_PASTE_PATH",
+    "NATIVE_WAIT_AND_PASTE",
+    "NATIVE_CLICK_AT_SCREEN",
+    "NATIVE_CLEANUP"
+  ],
+  "storage_keys": [
+    "wa_history",
+    "whatsapp_logged_in",
+    "whatsapp_status_updated_at"
+  ],
+  "native_messaging_host": "com.arad.bridge"
+}

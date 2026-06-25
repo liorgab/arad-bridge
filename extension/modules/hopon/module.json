@@ -1,0 +1,23 @@
+{
+  "id": "hopon",
+  "name": "HopOn — ניהול נסיעות",
+  "version": "1.0.0",
+  "description": "אינטגרציה עם פלטפורמת HopOn לניהול נסיעות עובדים — סנכרון tokens אוטומטי",
+  "category": "transport",
+  "sku": "HOPON_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "https://b2b-dashboard.hopon.co/*",
+    "https://api-gateway.hopon.co/*"
+  ],
+  "content_scripts": [
+    {
+      "file": "modules/hopon/content.js",
+      "matches": ["https://b2b-dashboard.hopon.co/*"],
+      "run_at": "document_idle"
+    }
+  ],
+  "handler": "modules/hopon/handler.js",
+  "message_types": ["GET_HOPON_TOKEN", "OPEN_HOPON"],
+  "storage_keys": ["hopon_token", "hopon_token_updated_at"]
+}
