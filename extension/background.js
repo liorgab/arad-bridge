@@ -26,7 +26,7 @@ import {
 } from './core/modules-registry.js';
 import {
   isModuleEnabled,
-  getEnabledModules,
+  getEffectiveEnabledModules,
   getCustomerInfo
 } from './core/storage.js';
 import {
@@ -68,7 +68,11 @@ function getHandler(moduleId) {
 // ─── Core message handlers (always available) ────────────────────
 const coreHandlers = {
   GET_BRIDGE_STATUS: async () => {
-    const enabled = await getEnabledModules();
+    // EFFECTIVE = server (handshake) ∪ user overrides (popup toggles).
+    // Reading getEnabledModules() here was the bug: it returns the empty
+    // server-set list until handshake succeeds, so manual toggles never
+    // showed up in the status view ("לא הופעלו מודולים").
+    const enabled = await getEffectiveEnabledModules();
     const customer = await getCustomerInfo();
 
     // ─── Legacy compatibility: per-module health in flat shape ──────
@@ -109,7 +113,7 @@ const coreHandlers = {
   HANDSHAKE: async (payload) => handleHandshake(payload),
 
   GET_ENABLED_MODULES: async () => {
-    return { enabled_modules: await getEnabledModules() };
+    return { enabled_modules: await getEffectiveEnabledModules() };
   },
 
   CHECK_MODULE_REQUIREMENTS: async ({ module_id }) => {
@@ -162,7 +166,7 @@ const coreHandlers = {
   // Returns: { piba: {ok, status, message, hint?, detail?}, hopon: {...}, ... }
   // Includes ALL modules (even disabled ones, marked as 'DISABLED').
   GET_MODULE_HEALTH: async () => {
-    const enabled = new Set(await getEnabledModules());
+    const enabled = new Set(await getEffectiveEnabledModules());
     const result = {};
     for (const [id, healthFn] of Object.entries(HEALTH_CHECKS)) {
       if (!enabled.has(id)) {
