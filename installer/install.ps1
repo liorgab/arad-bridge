@@ -602,7 +602,15 @@ function Step-ManualInstructions($idx, $total) {
     Write-Host '   └─────────────────────────────────────────────────────────────┘' -ForegroundColor Yellow
 
     if (-not $SkipExtensionPrompt) {
-        Start-Process 'chrome://extensions/'
+        # Open chrome://extensions/ — must launch via chrome.exe directly,
+        # because Windows doesn't register chrome:// as a system URL protocol
+        # (Start-Process chrome://... pops a Microsoft Store dialog).
+        $chromeExe = Find-Chrome
+        if ($chromeExe -and (Test-Path $chromeExe)) {
+            Start-Process -FilePath $chromeExe -ArgumentList 'chrome://extensions/' -ErrorAction SilentlyContinue
+        } else {
+            Write-Info 'Chrome not found - open chrome://extensions/ manually'
+        }
     }
 
     Write-Host ''
