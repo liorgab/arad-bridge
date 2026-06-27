@@ -43,9 +43,9 @@ export async function setEnabledModules(moduleIds) {
   await chrome.storage.local.set({ [KEYS.ENABLED_MODULES]: moduleIds });
 }
 
-/** Quick boolean check for a single module. */
+/** Quick boolean check for a single module — EFFECTIVE (server + user overrides). */
 export async function isModuleEnabled(id) {
-  const list = await getEnabledModules();
+  const list = await getEffectiveEnabledModules();
   return list.includes(id);
 }
 

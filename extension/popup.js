@@ -320,7 +320,18 @@ function showUpdateBanner(latestVersion, url) {
   document.body.insertBefore(banner, document.body.firstChild);
 }
 
+// Display the actual extension version in the popup header + status pill
+// (was previously hardcoded to v2.0.0 in popup.html — out of sync after every release)
+function paintVersion() {
+  const ver = chrome.runtime.getManifest().version;
+  const a = document.getElementById('ext-version-header');
+  const b = document.getElementById('ext-version-status');
+  if (a) a.textContent = ver;
+  if (b) b.textContent = ver;
+}
+
 // Run on popup open
+paintVersion();
 checkForUpdates();
 
 init();
