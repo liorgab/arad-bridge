@@ -1644,8 +1644,6 @@ def bulk_send():
                 _jobs[job_id]['status'] = 'failed'
             finally:
                 _job_lock.release()
-        log(f"[/bulk_send 500] {type(e).__name__}: {e}")
-        log(traceback.format_exc())
 
         t = threading.Thread(target=worker, daemon=True)
         _jobs[job_id]['thread'] = t
@@ -1659,8 +1657,6 @@ def bulk_send():
         })
     except Exception as e:
         _job_lock.release()
-        log(f"[/bulk_send 500] {type(e).__name__}: {e}")
-        log(traceback.format_exc())
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 

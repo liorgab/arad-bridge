@@ -39,22 +39,23 @@ Write-Host "  [OK] VERSION file synced to $Version" -ForegroundColor Green
 # Detect files on disk smaller than HEAD (silent corruption). If we skip this,
 # a broken file gets zipped into the release and breaks every install.
 Write-Host "  Checking for truncated files vs git HEAD..." -ForegroundColor Yellow
+# Previously: 10% tolerance — failed to catch 487-byte truncation in install.ps1 (1.5%).
+# New rule: scan ALL tracked files. Any working-tree file more than 50 bytes
+# smaller than its HEAD version is treated as truncated and aborts the release.
+# (50 bytes covers trailing-whitespace / newline differences without ever
+# missing a real cut.)
 Push-Location $repoRoot
 $truncated = @()
-$filesToCheck = @(
-    'extension/background.js',
-    'extension/manifest.json',
-    'installer/install.ps1',
-    'installer/uninstall.ps1',
-    'installer/release.ps1'
-)
-foreach ($f in $filesToCheck) {
+$tracked = git ls-tree -r --name-only HEAD 2>$null
+foreach ($f in $tracked) {
     if (-not (Test-Path $f)) { continue }
+    # Skip binary-ish files where text comparison is noisy
+    if ($f -match '\.(png|jpg|jpeg|gif|ico|zip|pdf)$') { continue }
     $diskSize = (Get-Item $f).Length
     $headBytes = git show "HEAD:$f" 2>$null | Out-String
     $headSize = $headBytes.Length
-    if ($headSize -gt 0 -and $diskSize -lt ($headSize * 0.9)) {
-        $truncated += ('{0} (disk={1}, HEAD={2})' -f $f, $diskSize, $headSize)
+    if ($headSize -gt 0 -and ($headSize - $diskSize) -gt 50) {
+        $truncated += ('{0} (disk={1}, HEAD={2}, missing={3})' -f $f, $diskSize, $headSize, ($headSize - $diskSize))
     }
 }
 Pop-Location
