@@ -1,2 +1,6 @@
 build/
 *.zip
+daemon/__pycache__/
+__pycache__/
+*.pyc
+daemon/profile/
