@@ -46,16 +46,19 @@ Write-Host "  Checking for truncated files vs git HEAD..." -ForegroundColor Yell
 # missing a real cut.)
 Push-Location $repoRoot
 $truncated = @()
-$tracked = git ls-tree -r --name-only HEAD 2>$null
-foreach ($f in $tracked) {
-    if (-not (Test-Path $f)) { continue }
-    # Skip binary-ish files where text comparison is noisy
-    if ($f -match '\.(png|jpg|jpeg|gif|ico|zip|pdf)$') { continue }
-    $diskSize = (Get-Item $f).Length
-    $headBytes = git show "HEAD:$f" 2>$null | Out-String
-    $headSize = $headBytes.Length
+# git ls-tree returns "<mode> <type> <hash> <size>\t<path>" with -l flag — read size DIRECTLY
+# (avoid `git show ... | Out-String` which converts LF→CRLF and inflates the size by 1 byte/line)
+$tracked = git ls-tree -r -l HEAD 2>$null
+foreach ($line in $tracked) {
+    $parts = $line -split '\s+', 5
+    if ($parts.Count -lt 5) { continue }
+    $headSize = [int]$parts[3]
+    $path = $parts[4] -replace '^\t', ''
+    if (-not (Test-Path $path)) { continue }
+    if ($path -match '\.(png|jpg|jpeg|gif|ico|zip|pdf)$') { continue }
+    $diskSize = (Get-Item $path).Length
     if ($headSize -gt 0 -and ($headSize - $diskSize) -gt 50) {
-        $truncated += ('{0} (disk={1}, HEAD={2}, missing={3})' -f $f, $diskSize, $headSize, ($headSize - $diskSize))
+        $truncated += ('{0} (disk={1}, HEAD={2}, missing={3})' -f $path, $diskSize, $headSize, ($headSize - $diskSize))
     }
 }
 Pop-Location
