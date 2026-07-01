@@ -1,29 +1,50 @@
 #!/usr/bin/env python3
 """
 ARAD Bulk WhatsApp Sender Daemon
-====================================
-HTTP server on localhost:8766 that uses Selenium + Chrome for Testing to send
-WhatsApp messages in bulk, WITHOUT any user activation dialogs (unlike regular
-Chrome). This is the same technique WhatsApp Blaster VBA uses.
+================================
+HTTP server on localhost:8766 that sends WhatsApp messages in bulk via a
+persistent Chrome for Testing session, WITHOUT any user activation dialogs.
 
-Architecture:
+Architecture (two processes):
+
+    ┌─────────────────────────┐        line-delimited JSON-RPC        ┌──────────────────────────┐
+    │  arad_bulk_daemon.py     │   stdin  ──{"cmd":"send_message"}──▶  │  arad_driver_worker.py   │
+    │  (THIS FILE)             │   stdout ◀──{"success": true}────────  │  (Selenium subprocess)   │
+    │                          │   stderr ──(logs)──▶ daemon log file  │                          │
+    │  • Flask HTTP server     │                                       │  • OWNS the WebDriver    │
+    │  • job orchestration     │                                       │  • Chrome for Testing    │
+    │  • SSE progress / pause  │                                       │  • all WA Web automation │
+    │  • NO Selenium at all    │                                       │  • all XPath selectors   │
+    └─────────────────────────┘                                       └──────────────────────────┘
+
+Why two processes? Creating webdriver.Chrome() from inside a Flask request
+handler reliably fails on Windows with "session not created: Chrome instance
+exited" — Flask/werkzeug mutate process state in a way that breaks chromedriver's
+bootstrap. The cure is to keep ALL Selenium code in a process that never runs
+Flask. See arad_driver_worker.py for the worker side.
+
+The daemon keeps everything that does NOT touch Selenium: HTTP endpoints, the
+bulk-send loop (delays, pause/stop, SSE progress), attachment download/decode,
+and the worker subprocess lifecycle. Each driver operation is a one-line RPC.
+
+Architecture (the request path that the ARAD extension depends on):
   ARAD app (in regular Chrome) → Extension → POST localhost:8766/bulk_send
-  → this daemon → Selenium → Chrome for Testing → WhatsApp Web
+  → this daemon → worker subprocess → Selenium → Chrome for Testing → WA Web
 
-Key features:
-  - Persistent Chrome Test session (QR scan once, stays logged in)
-  - No file dialog interaction (Selenium's send_keys on <input type="file">)
-  - Random delays 20-40s between messages (anti-ban)
-  - Progress streaming via Server-Sent Events (SSE)
-  - Graceful failure: one bad contact doesn't stop the batch
+Endpoints (unchanged contract — the extension depends on these):
+  GET  /status              daemon status + driver/login state
+  POST /open_whatsapp       open Chrome Test + WhatsApp (first-time QR scan)
+  POST /bulk_send           start a bulk job, returns {job_id}
+  GET  /progress/<id>       SSE stream of progress events
+  POST /stop/<id>           stop a running job
+  POST /pause/<id>          pause a running job
+  POST /resume/<id>         resume a paused job
+  GET  /selectors           inspect current XPath/CSS selectors
+  POST /selectors           update selectors at runtime (persisted to config.json)
+  POST /diagnostics         test every selector against current WA Web state
+  POST /shutdown            close Chrome Test + shut the daemon down
 
-Endpoints:
-  POST /bulk_send      start a bulk job, returns {job_id}
-  GET  /progress/<id>  SSE stream of {index, phone, status, ...}
-  GET  /status         daemon status + is WA logged in
-  POST /shutdown       graceful shutdown (closes Chrome Test)
-
-Requires: python 3.8+, selenium, flask, flask-cors, requests
+Requires: python 3.8+, flask, flask-cors, requests, selenium (in the worker)
 """
 
 import os
@@ -36,35 +57,16 @@ import random
 import threading
 import tempfile
 import traceback
-import re
-from urllib.parse import quote
+import subprocess
 
 try:
     from flask import Flask, request, jsonify, Response, stream_with_context
     from flask_cors import CORS
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
     import requests
 except ImportError as e:
     print(f"FATAL: missing Python package: {e}", file=sys.stderr)
-    print("Run: pip install selenium flask flask-cors requests", file=sys.stderr)
+    print("Run: pip install flask flask-cors requests", file=sys.stderr)
     sys.exit(1)
-
-# pyperclip is optional - if unavailable we fall back to character-by-character typing.
-# It enables paste-from-clipboard which is ~10x faster than typing for long messages
-# (matches the WA Blaster approach: instant message appearance, not typing animation).
-try:
-    import pyperclip
-    HAS_PYPERCLIP = True
-except ImportError:
-    HAS_PYPERCLIP = False
 
 
 # ─── Configuration ────────────────────────────────────────────────
@@ -83,12 +85,23 @@ CONFIG_FILE = os.path.join(
     'AradBulkDaemon', 'config.json'
 )
 
+# The Selenium worker lives next to this file. install.ps1 copies BOTH files to
+# the runtime dir, so this sibling lookup resolves in production too.
+WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'arad_driver_worker.py')
+
 DEFAULT_DELAY_MIN_S = 20            # min seconds between messages (random)
 DEFAULT_DELAY_MAX_S = 40            # max seconds between messages (random)
 DEFAULT_ATTACHMENT_UPLOAD_DELAY_S = 4   # wait after click_send for attachment upload
 DEFAULT_ACTION_DELAY_S = 1.0        # wait after typing/before send (general)
 DAILY_CAP = 150                     # anti-ban cap per 24h
 PER_MINUTE_CAP = 3
+
+# RPC timeouts (seconds). A single message can take up to ~45s for chat load
+# plus attachment upload, so send_message gets generous headroom.
+RPC_TIMEOUT_DEFAULT = 30
+RPC_TIMEOUT_SEND = 120
+RPC_TIMEOUT_LOGIN = 200
 
 
 # ─── Logging ────────────────────────────────────────────────────────
@@ -104,7 +117,7 @@ def log(msg, *args):
         pass
 
 
-# ─── Config ─────────────────────────────────────────────────────────
+# ─── Config (daemon only needs the paths for /status + startup checks) ─
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -115,1121 +128,206 @@ def load_config():
     return {}
 
 
-def save_config(cfg):
-    try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=2)
-    except Exception as e:
-        log(f'config save failed: {e}')
-
-
 CONFIG = load_config()
 CHROME_PATH = CONFIG.get('chrome_path', DEFAULT_CHROME_PATH)
 PROFILE_DIR = CONFIG.get('profile_dir', DEFAULT_PROFILE_DIR)
 CHROMEDRIVER_PATH = CONFIG.get('chromedriver_path', DEFAULT_CHROMEDRIVER)
 
 
-# ─── XPath / CSS Selectors (WA Blaster style) ───────────────────────
-# WhatsApp Web changes its DOM frequently. Instead of hardcoding selectors
-# in code, we keep them in config.json so the user can update them when
-# WA Web changes - WITHOUT modifying any code.
-#
-# Each selector has a primary version + alt fallback. We try primary first;
-# if not found, fall back to alt. This is exactly how WA Blaster handles
-# DOM versioning (Version_A / Version_B).
-#
-# To update a selector when WA breaks: edit config.json and restart the daemon.
-# To get fresh selectors: open WA Web, F12, find the element, copy XPath.
+# ─── Worker RPC client ──────────────────────────────────────────────
+# Talks to arad_driver_worker.py over its stdin/stdout. The protocol is
+# request/response: every command carries a monotonically increasing id and the
+# worker echoes it back. A background reader thread drains the worker's stdout
+# into a queue so we can apply per-call timeouts (Windows can't select() on
+# pipes). All calls are serialized by a lock, so only one command is ever in
+# flight; the id check discards any stale response left over from a timed-out
+# earlier call, keeping the channel from desyncing.
 
-DEFAULT_SELECTORS = {
-    # When the chat-loading modal popup is showing
-    'CSSClassModalPopup':              '[data-animate-modal-popup]',
-    'CSSClassModalPopup_Alt':          '[data-animate-modal-popup]',
-
-    # The "OK" button on the invalid-phone-number popup
-    'XPathInvalidPhoneNumber':         "//*[@id='app']/div/span[2]/div/span/div/div/div/div/div/div[2]/div/button",
-    'XPathInvalidPhoneNumber_Alt':     "//*[@id='app']/div/span[2]/div/span/div/div/div/div/div/div[2]/div/button",
-
-    # The message text input (in chat footer) - this <p> being present means chat is loaded
-    'XPathTextInputField':             "//*[@id='main']/footer/div[1]/div/span/div/div/div/div[3]/div[1]/p",
-    'XPathTextInputField_Alt':         "//*[@id='main']/footer/div[1]/div/span/div/div/div/div[3]/div[1]/p",
-
-    # The search input at top of chat list (NOTE: it's an <input>, not contenteditable)
-    'XPathSearchInputField':           "//input[@aria-label='Search or start a new chat']",
-    'XPathSearchInputField_Alt':       "//input[@data-tab='3']",
-
-    # "No contact found" message in search results
-    'XPathNoContactFound':             "//*[@id='pane-side']/div[1]/div/span",
-    'XPathNoContactFound_Alt':         "//*[@id='pane-side']/div[1]/div/span",
-
-    # The "+" attachment button (modern WA)
-    'XPathAttachmentButton':           "//span[@data-icon='plus-rounded']",
-    'XPathAttachmentButton_Alt':       "//span[@data-icon='plus-rounded']",
-
-    # The "+" multiple-attachment button (newer style)
-    'XPathMultipleAttachmentButton':   "//span[@data-icon='plus']",
-    'XPathMultipleAttachmentButton_Alt': "//span[@data-icon='plus']",
-
-    # "Document" entry in attachment menu
-    'XPathDocumentAttachmentButton':   "//span[contains(text(), 'Document')]",
-    'XPathDocumentAttachmentButton_Alt': "//span[contains(text(), 'Document')]",
-
-    # "Photos & videos" entry in attachment menu
-    'XPathMediaAttachmentButton':      "//span[contains(text(), 'Photos & videos')]",
-    'XPathMediaAttachmentButton_Alt':  "//span[contains(text(), 'Photos & videos')]",
-
-    # First search result row (when typing in search)
-    'XPathFirstSearchResult':          "//div[@aria-label='Search results.']//div[@role='gridcell'][@tabindex='0']",
-    'XPathFirstSearchResult_Alt':      "//div[@id='pane-side']//div[@role='gridcell'][@tabindex='0']",
-}
-
-# Merge defaults with user overrides from config.json
-SELECTORS = dict(DEFAULT_SELECTORS)
-SELECTORS.update(CONFIG.get('selectors', {}))
+class WorkerError(Exception):
+    pass
 
 
-def get_selector(name):
-    """Get a selector by name. Returns the configured value or default."""
-    return SELECTORS.get(name, DEFAULT_SELECTORS.get(name, ''))
+class WorkerBusy(Exception):
+    """Raised by try_call when the worker is busy with another command."""
+    pass
 
 
-def get_selector_pair(base_name):
-    """Returns (primary, alt) selector strings for a given base name."""
-    return get_selector(base_name), get_selector(f'{base_name}_Alt')
+_DEAD = object()  # sentinel pushed onto the response queue when the worker dies
 
 
-# ─── Selenium driver (singleton, persistent) ───────────────────────
-_driver = None
-_driver_lock = threading.Lock()
-_last_activity = 0
+class WorkerClient:
+    def __init__(self, script_path):
+        self._script = script_path
+        self._lock = threading.Lock()
+        self._proc = None
+        self._responses = None
+        self._reader = None
+        self._stderr_f = None
+        self._next_id = 1
+
+    # ── lifecycle ──────────────────────────────────────────────────
+    def _spawn(self):
+        """(Re)spawn the worker subprocess and its stdout reader thread."""
+        self._close_proc()
+
+        # Worker stderr → daemon log file (the worker writes its human-readable
+        # logs there; stdout stays clean for JSON responses).
+        try:
+            self._stderr_f = open(LOG_FILE, 'a', encoding='utf-8', errors='replace')
+        except Exception:
+            self._stderr_f = subprocess.DEVNULL
+
+        creationflags = 0
+        if os.name == 'nt':
+            # Don't pop a console window for the worker.
+            creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+        log(f'spawning worker: {self._script}')
+        self._proc = subprocess.Popen(
+            [sys.executable, self._script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_f,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,  # line-buffered
+            creationflags=creationflags,
+        )
+
+        # Fresh queue per spawn so stale responses / _DEAD sentinels from a
+        # previous worker can't poison the new one.
+        self._responses = queue.Queue()
+        q = self._responses
+        proc = self._proc
+        self._reader = threading.Thread(
+            target=self._read_loop, args=(proc, q), daemon=True
+        )
+        self._reader.start()
+
+    def _read_loop(self, proc, q):
+        """Drain the worker's stdout, putting each parsed JSON line on q."""
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    q.put(json.loads(line))
+                except Exception:
+                    # Non-JSON on stdout shouldn't happen (worker logs to
+                    # stderr); log and ignore so it can't break a call.
+                    log(f'worker emitted non-JSON on stdout: {line[:200]}')
+        except Exception as e:
+            log(f'worker reader error: {e}')
+        finally:
+            q.put(_DEAD)
+
+    def _close_proc(self):
+        if self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+        if self._stderr_f not in (None, subprocess.DEVNULL):
+            try:
+                self._stderr_f.close()
+            except Exception:
+                pass
+        self._stderr_f = None
+
+    def _ensure_alive(self):
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn()
+
+    def start(self):
+        with self._lock:
+            self._ensure_alive()
+
+    def stop(self):
+        """Best-effort: ask the worker to quit, then terminate the process."""
+        with self._lock:
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.stdin.write(json.dumps({'id': -1, 'cmd': 'shutdown'}) + '\n')
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+            self._close_proc()
+
+    # ── calls ──────────────────────────────────────────────────────
+    def _call_locked(self, cmd, timeout):
+        """Send a command and wait for its response. Caller holds self._lock."""
+        self._ensure_alive()
+        req_id = self._next_id
+        self._next_id += 1
+        payload = dict(cmd)
+        payload['id'] = req_id
+        try:
+            self._proc.stdin.write(json.dumps(payload, ensure_ascii=True) + '\n')
+            self._proc.stdin.flush()
+        except Exception as e:
+            raise WorkerError(f'failed to send command {cmd.get("cmd")}: {e}')
+
+        deadline = time.time() + timeout
+        q = self._responses
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise WorkerError(
+                    f'worker timeout after {timeout}s for cmd {cmd.get("cmd")}'
+                )
+            try:
+                resp = q.get(timeout=remaining)
+            except queue.Empty:
+                raise WorkerError(
+                    f'worker timeout after {timeout}s for cmd {cmd.get("cmd")}'
+                )
+            if resp is _DEAD:
+                raise WorkerError('worker process died')
+            if resp.get('id') == req_id:
+                return resp
+            # Stale response from an earlier (timed-out) call — discard.
+            log(f'discarding stale worker response id={resp.get("id")} '
+                f'(waiting for {req_id})')
+
+    def call(self, cmd, timeout=RPC_TIMEOUT_DEFAULT):
+        with self._lock:
+            return self._call_locked(cmd, timeout)
+
+    def try_call(self, cmd, timeout=RPC_TIMEOUT_DEFAULT):
+        """Like call(), but raises WorkerBusy instead of blocking if the worker
+        is already handling another command. Used by /status so it stays snappy
+        during a bulk send."""
+        if not self._lock.acquire(blocking=False):
+            raise WorkerBusy()
+        try:
+            return self._call_locked(cmd, timeout)
+        finally:
+            self._lock.release()
+
+
+worker = WorkerClient(WORKER_SCRIPT)
+
+# Last known driver/login state, refreshed on every successful status probe so
+# /status can answer instantly (from cache) while a bulk job monopolizes the
+# worker channel.
+_last_known = {'driver_alive': False, 'wa_logged_in': False}
+
 _job_lock = threading.Lock()  # only one bulk job at a time
 
 
-def _kill_orphan_chrome_test():
-    """
-    Kill any chrome.exe processes that are using our profile dir.
-    Happens when the daemon was restarted but Chrome Test wasn't closed -
-    Windows locks the user-data-dir and new webdriver.Chrome() fails.
-    Uses wmic for compatibility with all Windows versions.
-    """
-    if os.name != 'nt':
-        return
-    import subprocess
-    try:
-        # wmic outputs in UTF-16 by default - use CSV format for robustness
-        result = subprocess.run(
-            ['wmic', 'process', 'where', "name='chrome.exe'",
-             'get', 'ProcessId,CommandLine', '/format:csv'],
-            capture_output=True, text=True, timeout=10
-        )
-        killed = []
-        for line in result.stdout.splitlines():
-            if PROFILE_DIR in line:
-                # CSV format: Node,CommandLine,ProcessId
-                parts = line.strip().split(',')
-                if len(parts) >= 3:
-                    pid = parts[-1].strip()
-                    if pid.isdigit():
-                        try:
-                            subprocess.run(['taskkill', '/F', '/PID', pid],
-                                           capture_output=True, timeout=5)
-                            killed.append(pid)
-                        except Exception as e:
-                            log(f'failed to kill pid {pid}: {e}')
-        if killed:
-            log(f'killed {len(killed)} orphan chrome.exe PID(s): {killed}')
-            time.sleep(1.0)  # let Windows release the profile lock
-    except subprocess.TimeoutExpired:
-        log('wmic query timed out')
-    except FileNotFoundError:
-        # wmic not available on newer Windows - try PowerShell
-        try:
-            ps_cmd = (
-                "Get-WmiObject Win32_Process -Filter \"name='chrome.exe'\" | "
-                "Where-Object { $_.CommandLine -like '*" + PROFILE_DIR.replace('\\', '\\\\') + "*' } | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-            )
-            subprocess.run(['powershell', '-Command', ps_cmd],
-                           capture_output=True, timeout=15)
-            time.sleep(1.0)
-            log('killed orphan chrome.exe via PowerShell')
-        except Exception as e:
-            log(f'PowerShell fallback failed: {e}')
-    except Exception as e:
-        log(f'kill orphan failed (non-fatal): {e}')
-
-
-def get_driver():
-    """Get or create the Selenium driver. Creates if needed, reuses if alive."""
-    global _driver, _last_activity
-
-    with _driver_lock:
-        # Check if existing driver is still alive
-        if _driver is not None:
-            try:
-                _ = _driver.current_url  # ping
-                _last_activity = time.time()
-                return _driver
-            except Exception as e:
-                log(f'existing driver is dead: {e}, recreating')
-                try:
-                    _driver.quit()
-                except Exception:
-                    pass
-                _driver = None
-
-        # Create new driver
-        log(f'launching Chrome Test: {CHROME_PATH}')
-        log(f'profile dir: {PROFILE_DIR}')
-        os.makedirs(PROFILE_DIR, exist_ok=True)
-
-        options = Options()
-        options.binary_location = CHROME_PATH
-        options.add_argument(f'--user-data-dir={PROFILE_DIR}')
-        options.add_argument('--start-maximized')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-
-        # Kill any orphan Chrome Test that may be locking our profile
-        # (happens when daemon was restarted without closing Chrome Test)
-        _kill_orphan_chrome_test()
-
-        service = Service(CHROMEDRIVER_PATH)
-        try:
-            _driver = webdriver.Chrome(service=service, options=options)
-            # Hide webdriver flag
-            _driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            })
-        except Exception as e:
-            log(f'driver creation FAILED: {e}')
-            _driver = None
-            raise
-
-        _last_activity = time.time()
-        _driver.get('https://web.whatsapp.com')
-        log('navigated to web.whatsapp.com')
-        return _driver
-
-
-def shutdown_driver():
-    global _driver
-    with _driver_lock:
-        if _driver is not None:
-            try:
-                _driver.quit()
-                log('driver closed')
-            except Exception as e:
-                log(f'driver close error: {e}')
-            _driver = None
-
-
-# ─── WhatsApp helpers ───────────────────────────────────────────────
-def is_logged_in(driver, timeout_s=5):
-    """Check if logged into WhatsApp Web (no QR screen)."""
-    end = time.time() + timeout_s
-    while time.time() < end:
-        try:
-            # Logged-in markers
-            if driver.find_elements(By.CSS_SELECTOR, '#pane-side, [data-testid="chat-list"]'):
-                return True
-            # QR / landing screen markers
-            if driver.find_elements(By.CSS_SELECTOR, 'canvas[aria-label*="Scan"], [data-testid="qrcode"]'):
-                return False
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return False
-
-
-def wait_for_login(driver, timeout_s=120):
-    """Wait for user to scan QR. Returns True if logged in within timeout."""
-    log(f'waiting up to {timeout_s}s for QR scan / login...')
-    end = time.time() + timeout_s
-    while time.time() < end:
-        if is_logged_in(driver, timeout_s=1):
-            log('logged in!')
-            return True
-        time.sleep(2)
-    log('login timeout')
-    return False
-
-
-# ─── XPath / CSS helpers with A/B fallback (WA Blaster style) ───────
-
-def _xpath_or_css(driver, selector):
-    """Returns Selenium By tuple. Auto-detects XPath vs CSS by leading char."""
-    if selector.startswith('//') or selector.startswith('('):
-        return (By.XPATH, selector)
-    return (By.CSS_SELECTOR, selector)
-
-
-def is_present_with_fallback(driver, primary, alt):
-    """Check if element exists matching primary OR alt selector."""
-    for sel in (primary, alt):
-        if not sel:
-            continue
-        try:
-            by, value = _xpath_or_css(driver, sel)
-            if driver.find_elements(by, value):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def find_with_fallback(driver, primary, alt, timeout_ms=5000, poll_ms=200):
-    """
-    Find element matching primary OR alt selector. Polls until timeout.
-    Returns the element or None.
-    """
-    end = time.time() + (timeout_ms / 1000.0)
-    while time.time() < end:
-        for sel in (primary, alt):
-            if not sel:
-                continue
-            try:
-                by, value = _xpath_or_css(driver, sel)
-                elements = driver.find_elements(by, value)
-                for el in elements:
-                    try:
-                        if el.is_displayed():
-                            return el
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-        time.sleep(poll_ms / 1000.0)
-    return None
-
-
-def find_by_pair_name(driver, base_name, timeout_ms=5000):
-    """Convenience: find by selector base name (e.g., 'XPathSearchInputField')."""
-    primary, alt = get_selector_pair(base_name)
-    return find_with_fallback(driver, primary, alt, timeout_ms)
-
-
-def get_modal_popup_text(driver):
-    """
-    Returns the text content of the chat-loading modal popup, or empty string.
-    WA shows '[data-animate-modal-popup]' during navigation, with text like:
-      - "Starting chat" → still loading, keep waiting
-      - "Phone number ... not on WhatsApp" → invalid number, give up
-    """
-    primary, alt = get_selector_pair('CSSClassModalPopup')
-    for sel in (primary, alt):
-        if not sel:
-            continue
-        try:
-            by, value = _xpath_or_css(driver, sel)
-            elements = driver.find_elements(by, value)
-            for el in elements:
-                try:
-                    if el.is_displayed():
-                        return (el.text or '').strip()
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    return ''
-
-
-# ─── FAST PATH: Search-based navigation (no page reload) ────────────
-# Mimics WhatsApp Blaster's approach: load WA Web ONCE, then use the
-# internal search box to jump between chats. Saves 20-25 seconds per
-# message vs the URL-based driver.get() approach.
-
-def find_search_box(driver, debug=False):
-    """
-    Find the main WhatsApp Web search input using configured XPath selectors.
-    Uses XPathSearchInputField with XPathSearchInputField_Alt fallback,
-    matching WA Blaster's strategy. Selectors are loaded from config.json
-    so they can be updated when WA Web changes - without code changes.
-    """
-    return find_by_pair_name(driver, 'XPathSearchInputField', timeout_ms=500)
-
-
-def ensure_wa_web_loaded(driver, timeout_s=60):
-    """
-    Ensure WhatsApp Web is fully loaded. Navigate to root URL ONCE if needed.
-    After this call, the search box must be findable and clickable.
-    Idempotent - cheap if already loaded.
-    """
-    t_total = time.time()
-    current_url = driver.current_url or ''
-
-    # Need to navigate if not on WA Web, OR if on a /send URL (we want the main view)
-    needs_navigate = (
-        'web.whatsapp.com' not in current_url or '/send' in current_url
-    )
-
-    if needs_navigate:
-        log(f'init: navigating to web.whatsapp.com root (was: {current_url[:80] if current_url else "(blank)"})')
-        t_nav = time.time()
-        driver.get('https://web.whatsapp.com/')
-        log(f'  ⏱ [DIAG] init driver.get: {time.time() - t_nav:.2f}s')
-
-    # Wait for search box to be visible (= app fully loaded)
-    t_wait = time.time()
-    last_debug_dump = 0
-    while time.time() - t_wait < timeout_s:
-        search = find_search_box(driver)
-        if search:
-            log(f'  ⏱ [DIAG] WA Web ready (search box visible): {time.time() - t_total:.2f}s')
-            return search
-
-        # Every 10s, dump debug info about what the DOM contains
-        if time.time() - last_debug_dump > 10:
-            try:
-                debug_info = driver.execute_script("""
-                    const all = document.querySelectorAll('[contenteditable="true"]');
-                    return Array.from(all).map(el => ({
-                        visible: el.offsetParent !== null,
-                        inFooter: !!el.closest('footer'),
-                        inDialog: !!el.closest('[role="dialog"]'),
-                        rect: (() => { const r = el.getBoundingClientRect(); return {top: r.top, left: r.left, w: r.width, h: r.height}; })(),
-                        placeholder: el.getAttribute('aria-placeholder') || '',
-                        label: el.getAttribute('aria-label') || '',
-                        role: el.getAttribute('role') || '',
-                        dataTab: el.getAttribute('data-tab') || ''
-                    }));
-                """)
-                log(f'  [DEBUG] all contenteditable on page: {debug_info}')
-            except Exception as e:
-                log(f'  [DEBUG] dump failed: {e}')
-            last_debug_dump = time.time()
-
-        time.sleep(0.5)
-
-    raise Exception(f'WA Web did not finish loading within {timeout_s}s')
-
-
-def _get_chat_header_text(driver):
-    """
-    Read the open chat's header (recipient name/number).
-    Used to verify that we navigated to the right chat after search.
-    Returns empty string if no chat is open.
-    """
-    try:
-        return driver.execute_script("""
-            // The chat header is in #main > header at the top of the chat pane
-            const header = document.querySelector('#main header');
-            if (!header) return '';
-            // Try to grab the most prominent text (contact name/number)
-            const titleEl = header.querySelector('span[dir="auto"][title], h1, [data-testid="conversation-info-header"] span');
-            if (titleEl) return (titleEl.getAttribute('title') || titleEl.textContent || '').trim();
-            return (header.textContent || '').trim().slice(0, 200);
-        """) or ''
-    except Exception:
-        return ''
-
-
-def open_chat_via_search(driver, phone, timeout_s=15):
-    """
-    Open a chat by typing the phone number in WA Web's search box.
-    NO page reload - much faster than driver.get(/send?phone=X).
-
-    Returns the message input element on success, or None on failure.
-    Caller should fall back to URL-based open_chat if this returns None.
-
-    SAFETY: Verifies the chat actually changed by comparing header before/after.
-    Without this verification, a failed search-and-enter could leave us in
-    the previous chat, and we'd send the new message to the wrong person.
-    """
-    digits = re.sub(r'\D', '', str(phone))
-    # WA Blaster searches with raw digits (no + prefix) - confirmed via video frame analysis.
-    # Using just digits avoids the IME/symbol typing overhead and matches what WA Web's
-    # search index actually keys on (E.164 stored without +).
-    search_term = digits
-
-    # Capture the chat header BEFORE search - we'll use this to verify navigation
-    header_before = _get_chat_header_text(driver)
-
-    # Locate search box
-    search = find_search_box(driver)
-    if not search:
-        log('  search box not found - need URL fallback')
-        return None
-
-    t_search_start = time.time()
-
-    # ─── Reset + focus the search box (3-layer reliability) ─────────
-    # Layer 1: Click via Selenium (normal interaction)
-    try:
-        search.click()
-    except Exception:
-        pass
-    # Layer 2: JS click in case Selenium click was blocked
-    try:
-        driver.execute_script('arguments[0].click();', search)
-    except Exception:
-        pass
-    # Layer 3: Force focus directly via JS - this is what really matters
-    try:
-        driver.execute_script("""
-            arguments[0].focus();
-            arguments[0].value = '';
-            arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
-        """, search)
-    except Exception as e:
-        log(f'  ⚠ search box JS focus/clear failed: {e}')
-        return None
-    time.sleep(0.2)
-
-    # NOTE: We don't strict-check focus here. WA Web's DOM is quirky and
-    # document.activeElement may not exactly match `search` even when typing
-    # actually goes to the search box. We rely on TWO downstream safety nets:
-    #   (1) Click on FIRST RESULT explicitly via XPath (no Enter key)
-    #   (2) Verify chat header CHANGED before returning the input
-    # If either fails, we abort and fall back to URL navigation - safe.
-
-    # Type the phone number with international + prefix
-    ActionChains(driver).send_keys(search_term).perform()
-    time.sleep(0.7)  # let WA render search results
-
-    # ─── CRITICAL CHANGE: click the FIRST RESULT explicitly via XPath ────
-    # Pressing Enter is unreliable - sometimes leaves us on the previous chat.
-    # Using the configured XPathFirstSearchResult is what WA Blaster does.
-    first_result = find_by_pair_name(driver, 'XPathFirstSearchResult', timeout_ms=3000)
-
-    if first_result:
-        try:
-            first_result.click()
-            log(f'  ⏱ [DIAG] clicked first search result: {time.time() - t_search_start:.2f}s')
-        except Exception as e:
-            # Try JS click
-            try:
-                driver.execute_script('arguments[0].click();', first_result)
-                log(f'  ⏱ [DIAG] JS-clicked first search result: {time.time() - t_search_start:.2f}s')
-            except Exception:
-                log(f'  ⚠ failed to click search result: {e} - aborting')
-                return None
-    else:
-        # No search result found - either number not in WA, or search didn't render
-        log(f'  ⚠ no search result for {search_term} after {time.time() - t_search_start:.2f}s')
-        return None
-
-    # Wait for chat input AND verify chat header changed (= we're in the right chat)
-    t_input_wait = time.time()
-    chat_changed = False
-
-    while time.time() - t_input_wait < timeout_s:
-        # Check if chat header changed (= we navigated to a new chat)
-        if not chat_changed:
-            header_now = _get_chat_header_text(driver)
-            if header_now and header_now != header_before:
-                chat_changed = True
-                log(f'  ✓ chat header changed: "{header_before[:40]}..." → "{header_now[:40]}..."')
-                # Soft verify: does the new header contain digits from our phone?
-                # (Not strict - WA may show display name instead of number)
-                last_4 = digits[-4:] if len(digits) >= 4 else digits
-                if last_4 and last_4 not in header_now:
-                    log(f'  ⚠ header doesn\'t contain phone last-4 ({last_4}) - may be display name, continuing')
-
-        # Find the chat input
-        inputs = driver.find_elements(
-            By.CSS_SELECTOR,
-            'footer div[contenteditable="true"][role="textbox"]'
-        )
-        if not inputs:
-            inputs = driver.find_elements(
-                By.CSS_SELECTOR,
-                'footer div[contenteditable="true"]'
-            )
-        for inp in inputs:
-            try:
-                if inp.is_displayed():
-                    # Only return when chat header has changed AND input found
-                    if chat_changed:
-                        log(f'  ⏱ [DIAG] chat input ready (after search): {time.time() - t_input_wait:.2f}s')
-                        return inp
-            except Exception:
-                continue
-        time.sleep(0.2)
-
-    # Timeout: chat header didn't change OR input never appeared
-    if not chat_changed:
-        log(f'  ⚠ chat header did NOT change within {timeout_s}s - search did NOT navigate. Aborting (will fallback to URL)')
-    else:
-        log(f'  ⚠ chat header changed but input did not appear within {timeout_s}s')
-    return None
-
-
-def _get_input_from_text_field_p(driver, p_element):
-    """
-    The XPathTextInputField points to a <p> element. Selenium can send_keys
-    to it directly, but WA's contenteditable div is the proper interaction
-    target. Try to climb up to it; fallback to the <p> itself.
-    """
-    if p_element is None:
-        return None
-    try:
-        ancestor = p_element.find_element(
-            By.XPATH, "./ancestor::div[@contenteditable='true']"
-        )
-        return ancestor or p_element
-    except Exception:
-        return p_element
-
-
-def wait_for_chat_state(driver, max_wait_s=20, stop_event=None):
-    """
-    WA Blaster-style chat load detection. Watches the chat-loading modal popup
-    AND the text input field simultaneously:
-      - popup with "Starting chat..." → still loading, keep waiting
-      - popup with any OTHER text     → invalid number, fail FAST (3-5s)
-      - text input appears            → chat ready, return it
-      - stop_event.is_set()           → aborted by user, raise to break loop
-
-    Returns: (state, payload)
-        state='ready'   → payload = text input element
-        state='invalid' → payload = popup text describing the problem
-        state='timeout' → payload = None
-        state='aborted' → payload = None  (stop_event was set)
-    """
-    start = time.time()
-    poll_interval = 0.15  # poll every 150ms - very responsive
-    while time.time() - start < max_wait_s:
-        # ─── 0. Check for user stop request FIRST ────────────────────
-        # This makes stop near-instant even during slow chat loads.
-        # Without this, stop can be delayed up to max_wait_s (45s) when
-        # the worker is stuck waiting for WA Web to load a slow chat.
-        if stop_event is not None and stop_event.is_set():
-            return ('aborted', None)
-        # ─── 1. Check for the modal popup (loading or error) ─────────
-        popup_text = get_modal_popup_text(driver)
-        if popup_text:
-            # Hebrew/English variations of "Starting chat..."
-            loading_markers = ('starting chat', 'מתחיל שיחה', 'cargando chat', 'iniciando')
-            popup_lower = popup_text.lower()
-            still_loading = any(m in popup_lower for m in loading_markers)
-            if still_loading:
-                time.sleep(poll_interval)
-                continue
-            # Popup with non-loading text = error (invalid number, etc.)
-            return ('invalid', popup_text)
-
-        # ─── 2. No popup - check if chat is ready (text input visible) ─
-        p_element = find_by_pair_name(driver, 'XPathTextInputField', timeout_ms=100)
-        if p_element:
-            input_element = _get_input_from_text_field_p(driver, p_element)
-            return ('ready', input_element)
-
-        time.sleep(poll_interval)
-
-    return ('timeout', None)
-
-
-def open_chat(driver, phone, message='', stop_event=None):
-    """
-    Open chat with phone number via URL navigation.
-    Uses WA Blaster's popup-based detection for fast outcomes:
-      - Invalid numbers fail in ~3-5s (popup text reveals it)
-      - Valid numbers ready in ~5-15s (text input appears)
-
-    stop_event: optional threading.Event - if set, wait_for_chat_state
-                will abort early so user-requested stops take effect fast.
-    """
-    digits = re.sub(r'\D', '', str(phone))
-    url = f'https://web.whatsapp.com/send?phone={digits}'
-    if message:
-        url += f'&text={quote(message)}'
-    log(f'navigating: wa.me/send?phone={digits}')
-
-    # ─── DIAGNOSTIC: measure navigation time ─────────────────────────
-    t_nav_start = time.time()
-    driver.get(url)
-    nav_time = time.time() - t_nav_start
-    log(f'  ⏱ [DIAG] navigate (driver.get): {nav_time:.2f}s')
-
-    # ─── WA Blaster-style detection (popup + input watcher) ──────────
-    # 45s handles WA Web reloads (when Chrome Test cycles WA the first
-    # load after reload is 30-60s). Invalid numbers still resolve in 3-5s
-    # via popup-text detection - no need to wait full timeout for those.
-    CHAT_LOAD_TIMEOUT_S = 45
-    t_wait_start = time.time()
-    state, payload = wait_for_chat_state(driver, max_wait_s=CHAT_LOAD_TIMEOUT_S,
-                                          stop_event=stop_event)
-    elapsed = time.time() - t_wait_start
-
-    if state == 'ready':
-        log(f'  ⏱ [DIAG] chat_load (input ready): {elapsed:.2f}s')
-        # Try to dismiss any post-navigation invalid-number popup just in case
-        try:
-            invalid_btn = find_by_pair_name(driver, 'XPathInvalidPhoneNumber', timeout_ms=100)
-            if invalid_btn:
-                invalid_btn.click()
-                time.sleep(0.2)
-        except Exception:
-            pass
-        return payload
-
-    if state == 'invalid':
-        log(f'  ⏱ [DIAG] invalid number detected in {elapsed:.2f}s: {payload[:120]}')
-        # Try to dismiss the popup so next attempt has clean state
-        try:
-            ok_btn = find_by_pair_name(driver, 'XPathInvalidPhoneNumber', timeout_ms=500)
-            if ok_btn:
-                ok_btn.click()
-                time.sleep(0.3)
-        except Exception:
-            pass
-        # Reset to root URL so next message's search-based path has clean DOM
-        # (without this, WA stays on /send?phone=X and search box gets weird)
-        try:
-            driver.get('https://web.whatsapp.com/')
-            time.sleep(0.8)
-        except Exception:
-            pass
-        raise Exception(f'invalid number: {digits} ({payload[:80]})')
-
-    if state == 'aborted':
-        log(f'  🛑 [STOP] chat load aborted by user stop request after {elapsed:.2f}s')
-        # Reset URL so subsequent messages (if any) have clean DOM
-        try:
-            driver.get('https://web.whatsapp.com/')
-            time.sleep(0.5)
-        except Exception:
-            pass
-        raise Exception('aborted by user')
-
-    # Timeout (state == 'timeout')
-    log(f'  ⏱ [DIAG] chat_load TIMEOUT after {elapsed:.2f}s')
-    # Reset URL on timeout so next message can use search
-    try:
-        driver.get('https://web.whatsapp.com/')
-        time.sleep(0.8)
-    except Exception:
-        pass
-    # Clearer error: explains the REAL cause (WA Web reload), not just symptom.
-    # The frontend log line is built as "lang: X - error: Y" so the cause
-    # text shows immediately and isn't masked by the language prefix.
-    raise Exception(
-        f'WhatsApp Web did not load chat for {digits} within '
-        f'{CHAT_LOAD_TIMEOUT_S}s (WA Web may be reloading - try again)'
-    )
-
-
-def attach_files(driver, file_paths):
-    """
-    Attach ONE OR MORE files to the current WhatsApp chat in a single batch.
-    Uses Selenium's send_keys('a\\nb\\nc') trick: passing newline-separated
-    paths to <input type="file" multiple> selects them all at once. WA shows
-    a single preview gallery with all files, and one Send action sends them
-    all together as one logical message (caption applies to first file).
-    """
-    if not file_paths:
-        raise Exception('attach_files called with empty list')
-    paths = file_paths if isinstance(file_paths, (list, tuple)) else [file_paths]
-    paths = [os.path.abspath(p) for p in paths]
-
-    # Validate all files exist BEFORE clicking - cleaner failure
-    for p in paths:
-        if not os.path.exists(p):
-            raise Exception(f'file not found: {p}')
-
-    log(f'attaching {len(paths)} file(s):')
-    for p in paths:
-        log(f'   - {os.path.basename(p)} ({os.path.getsize(p)} bytes)')
-
-    # Click attach button to render the file inputs (WA lazy-renders them)
-    try:
-        attach_btn = driver.find_element(By.CSS_SELECTOR, 'span[data-icon="plus-rounded"]')
-    except NoSuchElementException:
-        try:
-            attach_btn = driver.find_element(
-                By.CSS_SELECTOR, '[data-testid="clip"], button[aria-label*="Attach" i]'
-            )
-        except NoSuchElementException:
-            raise Exception('attach button not found')
-
-    # Ensure clickable
-    clickable = attach_btn
-    for _ in range(3):
-        try:
-            parent = clickable.find_element(By.XPATH, '..')
-            if parent.tag_name in ('button',) or parent.get_attribute('role') == 'button':
-                clickable = parent
-                break
-            clickable = parent
-        except Exception:
-            break
-    try:
-        clickable.click()
-    except Exception:
-        attach_btn.click()
-
-    time.sleep(0.8)
-
-    # Find ALL file inputs. With Chrome Test, we can send_keys directly to any.
-    # Prefer the one that accepts "*" (document), fall back to first.
-    file_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
-    log(f'found {len(file_inputs)} file inputs')
-    if not file_inputs:
-        raise Exception('no file input found in DOM')
-
-    target = None
-    for inp in file_inputs:
-        accept = (inp.get_attribute('accept') or '').lower()
-        log(f'  input accept="{accept}"')
-        if '*' == accept.strip() or accept == '' or 'application' in accept:
-            target = inp
-            break
-    if target is None:
-        target = file_inputs[0]
-
-    # CRITICAL: send_keys with newline-separated paths → multi-file selection
-    # in a single shot. This is how WA Web's <input type="file" multiple> works.
-    paths_concat = '\n'.join(paths)
-    log(f'sending {len(paths)} path(s) to file input via newline-join')
-    target.send_keys(paths_concat)
-
-    # Wait for preview(s) to appear. For multi-file uploads WA shows a
-    # gallery navigation; for single it shows the standard preview.
-    wait = WebDriverWait(driver, max(20, 5 * len(paths)))  # more time for many files
-    wait.until(
-        lambda d: d.find_elements(By.CSS_SELECTOR, '[data-testid="media-preview"]') or
-                  any(
-                      os.path.basename(paths[0]) in (el.text or '')
-                      for el in d.find_elements(By.CSS_SELECTOR, '[role="dialog"]')
-                  ) or
-                  d.find_elements(By.CSS_SELECTOR, 'img[src^="blob:"]')
-    )
-    log(f'preview appeared for {len(paths)} file(s)')
-
-
-def attach_file(driver, file_path):
-    """
-    BACKWARD COMPATIBILITY shim: routes single file through attach_files.
-    Existing callers continue to work unchanged.
-    """
-    return attach_files(driver, [file_path])
-
-
-def _type_with_newlines(driver, text):
-    """
-    LEGACY (slow) typing path: types text character-by-character using Shift+Enter
-    for newlines. Kept as a fallback when pyperclip is unavailable.
-
-    WhatsApp treats Enter as SEND, so a plain ActionChains.send_keys('a\\nb') would
-    send 'a' as one message and start typing 'b' in a new chat input — splitting
-    a multi-line template into multiple separate messages.
-    Shift+Enter inserts a soft line break without sending. Result: one message
-    with internal newlines, exactly as the template intends.
-    """
-    if not text:
-        return
-    # Normalize newline conventions
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    lines = text.split('\n')
-
-    actions = ActionChains(driver)
-    for i, line in enumerate(lines):
-        if line:
-            actions.send_keys(line)
-        if i < len(lines) - 1:
-            # Soft line break: Shift+Enter
-            actions.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT)
-    actions.perform()
-
-
-def _paste_with_newlines(driver, text):
-    """
-    PRIMARY (fast) input path: copies the text to the OS clipboard and pastes via
-    Ctrl+V — same approach as WA Blaster (visible in their video: instant message
-    appearance, no per-character typing animation).
-
-    Why this is dramatically faster:
-      - Typing 200 chars via ActionChains.send_keys: ~1.5–2.0 seconds
-      - Pasting 200 chars via clipboard: ~50–100 ms (single keyboard event)
-      Saving ~1.5s per message × 100 messages = ~2.5 minutes per batch.
-
-    Multi-line handling: copies the FULL text once and pastes once. WhatsApp Web's
-    contenteditable converts pasted '\\n' into soft line breaks correctly, so the
-    message stays as ONE message (not multiple). If for some reason WA splits
-    on newlines after paste, we fall back to per-line paste with explicit
-    Shift+Enter between lines.
-
-    Falls back to _type_with_newlines if pyperclip is not installed.
-    """
-    if not text:
-        return
-
-    if not HAS_PYPERCLIP:
-        log('  pyperclip unavailable — falling back to typing (slower)')
-        _type_with_newlines(driver, text)
-        return
-
-    # Normalize newline conventions
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    # Strategy A: paste the whole multi-line text in one shot (preferred — fewer
-    # keyboard events, less chance of focus drift between paste operations).
-    try:
-        pyperclip.copy(text)
-        # Tiny pause — some clipboard managers take a few ms to commit
-        time.sleep(0.05)
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-        return
-    except Exception as e:
-        log(f'  full-text paste failed ({e}) — trying per-line paste')
-
-    # Strategy B (fallback): paste line-by-line, with explicit Shift+Enter between.
-    # Each paste needs its own perform() because we mutate the clipboard between calls.
-    lines = text.split('\n')
-    try:
-        for i, line in enumerate(lines):
-            if line:
-                pyperclip.copy(line)
-                time.sleep(0.03)
-                ActionChains(driver).key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-            if i < len(lines) - 1:
-                ActionChains(driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
-        return
-    except Exception as e:
-        log(f'  per-line paste failed ({e}) — falling back to typing')
-
-    # Strategy C (last resort): character-by-character typing
-    _type_with_newlines(driver, text)
-
-
-def type_caption(driver, text):
-    """Type caption in preview mode. Falls back to main message input."""
-    if not text:
-        return
-
-    # Strategy 1: Caption-specific input (visible in preview mode)
-    candidates = driver.find_elements(
-        By.CSS_SELECTOR,
-        'div[contenteditable="true"][aria-label*="caption" i], '
-        'div[contenteditable="true"][aria-placeholder*="caption" i], '
-        'div[contenteditable="true"][aria-label*="הוסף כיתוב" i], '
-        'div[contenteditable="true"][aria-placeholder*="הוסף כיתוב" i], '
-        'div[contenteditable="true"][data-lexical-editor]'
-    )
-
-    # Strategy 2: any visible contenteditable that's NOT search and NOT the main msg footer
-    if not candidates:
-        all_editables = driver.find_elements(By.CSS_SELECTOR, 'div[contenteditable="true"]')
-        log(f'fallback: found {len(all_editables)} contenteditable elements')
-        for el in all_editables:
-            try:
-                if not el.is_displayed():
-                    continue
-                aria = (el.get_attribute('aria-label') or '').lower()
-                placeholder = (el.get_attribute('aria-placeholder') or '').lower()
-                if 'search' in aria or 'חיפוש' in aria:
-                    continue
-                # Prefer caption-like, avoid main footer message input
-                if 'caption' in aria or 'כיתוב' in aria or 'caption' in placeholder:
-                    candidates = [el]
-                    break
-                # Otherwise track as fallback
-                if not candidates:
-                    candidates = [el]
-            except Exception:
-                continue
-
-    if not candidates:
-        log('no caption input found - skipping caption')
-        return
-
-    target = candidates[0]
-    try:
-        target.click()
-        time.sleep(0.4)
-        # Clear any existing content first
-        target.send_keys(Keys.CONTROL, 'a')
-        target.send_keys(Keys.DELETE)
-        time.sleep(0.1)
-        # Paste (with Shift+Enter for newlines) so multi-line caption stays as ONE caption
-        _paste_with_newlines(driver, text)
-        log(f'pasted caption ({len(text)} chars): "{text[:50]}"')
-    except Exception as e:
-        log(f'caption type failed: {e}')
-
-
-def click_send(driver):
-    """Find and click the Send button (for preview mode or text mode)."""
-    log('looking for send button...')
-
-    # Strategy 1: aria-label Send (most stable)
-    candidates = list(driver.find_elements(
-        By.CSS_SELECTOR,
-        'button[aria-label="Send"], button[aria-label="שלח"], '
-        '[role="button"][aria-label="Send"], [role="button"][aria-label="שלח"], '
-        'button[aria-label*="Send" i], [role="button"][aria-label*="Send" i]'
-    ))
-    log(f'  aria-label matches: {len(candidates)}')
-
-    # Strategy 2: data-icon containing "send"
-    if not candidates:
-        send_icons = driver.find_elements(
-            By.CSS_SELECTOR,
-            'span[data-icon="send"], span[data-icon="wds-ic-send-filled"], '
-            'span[data-icon="send-filled"], span[data-icon*="send" i]'
-        )
-        for icon in send_icons:
-            try:
-                btn = icon.find_element(
-                    By.XPATH,
-                    './ancestor::button[1] | ./ancestor::*[@role="button"][1] | ./ancestor::div[@tabindex="0"][1]'
-                )
-                candidates.append(btn)
-            except Exception:
-                candidates.append(icon)
-        log(f'  data-icon matches: {len(candidates)}')
-
-    # Strategy 3: tell-tale green circular button at bottom-right
-    if not candidates:
-        all_buttons = driver.find_elements(
-            By.CSS_SELECTOR, 'button, [role="button"], div[tabindex="0"]'
-        )
-        for b in all_buttons:
-            try:
-                if not b.is_displayed() or not b.is_enabled():
-                    continue
-                rect = b.rect
-                if not rect or rect.get('width', 0) < 30 or rect.get('width', 0) > 90:
-                    continue
-                # Check if it has a send-ish SVG or icon
-                svgs = b.find_elements(By.CSS_SELECTOR, 'svg, span[data-icon*="send"]')
-                if svgs:
-                    candidates.append(b)
-            except Exception:
-                continue
-        log(f'  visual matches: {len(candidates)}')
-
-    if not candidates:
-        # Last resort: Ctrl+Enter keyboard shortcut
-        log('no send button found, trying Ctrl+Enter')
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys(Keys.ENTER).key_up(Keys.CONTROL).perform()
-        return
-
-    # Pick the first visible + enabled candidate
-    btn = None
-    for c in candidates:
-        try:
-            if c.is_displayed() and c.is_enabled():
-                aria_dis = c.get_attribute('aria-disabled')
-                if aria_dis == 'true':
-                    continue
-                btn = c
-                break
-        except Exception:
-            continue
-    if not btn:
-        btn = candidates[0]
-
-    try:
-        btn.click()
-        log('send clicked via element')
-    except Exception as e:
-        log(f'btn.click() failed: {e}, trying JS click')
-        driver.execute_script('arguments[0].click();', btn)
-        log('send clicked via JS')
-
-
-def send_single_message(driver, phone, message,
-                        file_path=None,
-                        file_paths=None,
-                        attachment_upload_delay=DEFAULT_ATTACHMENT_UPLOAD_DELAY_S,
-                        action_delay=DEFAULT_ACTION_DELAY_S,
-                        stop_event=None):
-    """
-    Complete flow: open chat, (attach files), type caption, send.
-
-    Attachments:
-      file_path:   legacy single-file param (backward compatible)
-      file_paths:  list of paths for multi-file (preferred for new code)
-
-    Tunable delays (defaults match WhatsApp Blaster's recommendations):
-      attachment_upload_delay - seconds to wait after click_send. PDFs and
-                                large galleries need more. Range: 2-15s.
-      action_delay            - seconds between sub-actions (typing → click).
-                                Range: 0.3-2s.
-
-    stop_event - optional threading.Event from caller. If set during
-                 chat-load wait, the operation aborts fast (raises
-                 'aborted by user') so user stop requests don't have
-                 to wait up to 45s for the WA Web load timeout.
-    """
-    t_msg_start = time.time()
-
-    # Normalize attachments to a list
-    attachments = []
-    if file_paths:
-        attachments = list(file_paths)
-    elif file_path:
-        attachments = [file_path]
-    has_attachments = len(attachments) > 0
-
-    # FAST PATH: try search-based navigation first (no page reload)
-    msg_input = open_chat_via_search(driver, phone)
-
-    # SLOW FALLBACK: if search failed (e.g. number not on WA / new contact),
-    # fall back to URL-based navigation which causes a full page reload.
-    if msg_input is None:
-        log('  ⚠ falling back to URL-based open_chat (slow path)')
-        msg_input = open_chat(driver, phone, message='' if has_attachments else '',
-                              stop_event=stop_event)
-
-    if has_attachments:
-        # ─── ATTACHMENT FLOW ─────────────────────────────────────────
-        t_attach_start = time.time()
-        attach_files(driver, attachments)
-        time.sleep(min(action_delay * 2, 3.0))  # let preview fully render (capped at 3s)
-
-        # CRITICAL: After file attach, the attach menu may still be open.
-        try:
-            body = driver.find_element(By.TAG_NAME, 'body')
-            ActionChains(driver).move_to_element(body).click().perform()
-            time.sleep(0.3)
-        except Exception as e:
-            log(f'body click skipped: {e}')
-        log(f'  ⏱ [DIAG] attach+preview: {time.time() - t_attach_start:.2f}s')
-
-        t_caption_start = time.time()
-        type_caption(driver, message or '')
-        time.sleep(action_delay)
-        log(f'  ⏱ [DIAG] caption_type: {time.time() - t_caption_start:.2f}s')
-
-        t_send_start = time.time()
-        click_send(driver)
-        time.sleep(attachment_upload_delay)  # PDFs take longer to upload
-        log(f'  ⏱ [DIAG] click_send + upload_wait: {time.time() - t_send_start:.2f}s')
-    else:
-        # ─── TEXT-ONLY FLOW ──────────────────────────────────────────
-        if message:
-            t_type_start = time.time()
-            msg_input.click()
-            time.sleep(0.2)
-            # Paste via clipboard (Ctrl+V) — ~10x faster than typing for long messages.
-            # Shift+Enter for embedded newlines so multi-line template stays as ONE message.
-            _paste_with_newlines(driver, message)
-            time.sleep(min(action_delay * 0.5, 1.0))  # short pause after paste
-            log(f'  ⏱ [DIAG] paste ({len(message)} chars): {time.time() - t_type_start:.2f}s')
-
-        t_send_start = time.time()
-        ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(min(action_delay * 1.5, 3.0))  # let WA process the send
-        log(f'  ⏱ [DIAG] enter+wait: {time.time() - t_send_start:.2f}s')
-
-    # ─── TOTAL MESSAGE TIME ─────────────────────────────────────────
-    total_time = time.time() - t_msg_start
-    log(f'  ⏱ [DIAG] ═══ TOTAL MESSAGE: {total_time:.2f}s ═══')
-
-
-# ─── Bulk job runner ────────────────────────────────────────────────
-_jobs = {}  # job_id -> { queue, thread, status }
-
-
+# ─── Attachment resolution (daemon-side I/O; no Selenium needed) ─────
 def _resolve_attachment_to_path(attachment_meta, employee_idx, att_idx):
     """
-    Convert an attachment meta dict to a local file path.
+    Convert an attachment meta dict to a local file path the worker can upload.
 
     attachment_meta supports two forms:
       { 'url':    'https://...', 'filename': 'doc.pdf' }   ← preferred (smaller payload)
@@ -1282,12 +380,22 @@ def _resolve_attachment_to_path(attachment_meta, employee_idx, att_idx):
         return None
 
 
+# ─── Bulk job runner ────────────────────────────────────────────────
+_jobs = {}  # job_id -> { queue, thread, status }
+
+
 def run_bulk_job(job_id, employees, template, attachment_path,
                  delay_min, delay_max,
                  attachment_upload_delay, action_delay,
                  stop_event):
-    """Runs in its own thread. Pushes progress to jobs[job_id]['queue']."""
+    """
+    Runs in its own thread. Drives the per-recipient loop and pushes progress to
+    jobs[job_id]['queue']. Each actual WhatsApp send is delegated to the worker
+    via a single send_message RPC; everything else (delays, pause, stop, SSE) is
+    handled here. Stop takes effect between messages.
+    """
     q = _jobs[job_id]['queue']
+
     def push(event):
         # CRITICAL: include job_id in EVERY event so the client can capture
         # it for stop/pause/resume control via /stop/<id>, /pause/<id>, /resume/<id>
@@ -1300,31 +408,37 @@ def run_bulk_job(job_id, employees, template, attachment_path,
     log(f'═══ JOB {job_id} STARTED with {len(employees)} messages ═══')
     push({'type': 'start', 'total': len(employees), 'timestamp': time.time()})
 
+    # ─── Ensure driver + login + WA Web readiness (all via worker) ───
     try:
-        driver = get_driver()
-        if not is_logged_in(driver):
+        prep = worker.call({'cmd': 'prepare_bulk'}, timeout=RPC_TIMEOUT_LOGIN)
+        if not prep.get('success'):
+            push({'type': 'error', 'message': f'driver init failed: {prep.get("error", "unknown")}'})
+            return
+        _last_known['driver_alive'] = True
+        _last_known['wa_logged_in'] = bool(prep.get('logged_in'))
+
+        if not prep.get('logged_in'):
             push({'type': 'need_login', 'message': 'WhatsApp not logged in. Scan QR in Chrome Test.'})
-            if not wait_for_login(driver, timeout_s=180):
+            login = worker.call({'cmd': 'wait_for_login', 'timeout_s': 180},
+                                timeout=RPC_TIMEOUT_LOGIN)
+            if not login.get('logged_in'):
                 push({'type': 'error', 'message': 'login timeout'})
                 return
+            _last_known['wa_logged_in'] = True
             push({'type': 'logged_in'})
 
         # ─── QUICK WA Web check (don't wait long) ────────────────────
-        # Don't waste time waiting for full WA Web load - it can take 1-3
-        # minutes on accounts with many chats. The first URL navigation
-        # will trigger full load anyway, and subsequent messages can use
-        # search-based fast path if/when WA finishes loading in background.
-        try:
-            quick_search = find_search_box(driver)
-            if quick_search:
-                log('═══ WA Web already loaded - search path will be fast ═══')
-                push({'type': 'wa_ready'})
-            else:
-                log('═══ WA Web not fully loaded yet - first msg will use URL ═══')
-                push({'type': 'wa_loading'})
-        except Exception as e:
-            log(f'  search check failed (non-fatal): {e}')
+        # The first message will trigger a full WA Web load anyway; subsequent
+        # messages use the fast search path once WA finishes loading.
+        if prep.get('wa_ready'):
+            log('═══ WA Web already loaded - search path will be fast ═══')
+            push({'type': 'wa_ready'})
+        else:
+            log('═══ WA Web not fully loaded yet - first msg will use URL ═══')
             push({'type': 'wa_loading'})
+    except WorkerError as e:
+        push({'type': 'error', 'message': f'driver/login failed: {e}'})
+        return
     except Exception as e:
         push({'type': 'error', 'message': f'driver/login failed: {e}', 'trace': traceback.format_exc()})
         return
@@ -1429,11 +543,19 @@ def run_bulk_job(job_id, employees, template, attachment_path,
                 [attachment_path] if attachment_path else None
             )
 
-            send_single_message(driver, phone, rendered,
-                                file_paths=file_paths_to_send,
-                                attachment_upload_delay=attachment_upload_delay,
-                                action_delay=action_delay,
-                                stop_event=stop_event)
+            # Delegate the actual WhatsApp send to the worker (one RPC).
+            result = worker.call({
+                'cmd': 'send_message',
+                'phone': phone,
+                'message': rendered,
+                'file_paths': file_paths_to_send,
+                'attachment_upload_delay': attachment_upload_delay,
+                'action_delay': action_delay,
+            }, timeout=RPC_TIMEOUT_SEND)
+
+            if not result.get('success'):
+                raise Exception(result.get('error', 'send failed'))
+
             outer_time = time.time() - t_outer_start
             msg_timings.append(outer_time)
             sent += 1
@@ -1446,12 +568,10 @@ def run_bulk_job(job_id, employees, template, attachment_path,
             outer_time = time.time() - t_outer_start
             msg_timings.append(outer_time)
             err = str(e)[:300]
-            # ─── Handle user stop mid-chat-load specially ────────────────
-            # When user presses Stop while we're waiting for a slow WA Web
-            # chat to load, wait_for_chat_state aborts and raises
-            # "aborted by user". This should NOT count as a failure - the
-            # user explicitly asked to halt, the message just hadn't been
-            # sent yet. Treat it as a clean stop and exit the loop.
+            # ─── Handle user stop mid-message specially ──────────────────
+            # If the user pressed Stop while the worker was mid-send, treat the
+            # "aborted by user" error (or a set stop flag) as a clean stop, not
+            # a failure, and exit the loop.
             if 'aborted by user' in err or stop_event.is_set():
                 log(f'  🛑 STOP detected mid-message for {phone} (after {outer_time:.2f}s) - halting loop')
                 push({'type': 'stopped', 'at_index': idx})
@@ -1528,15 +648,19 @@ def _ensure_cors_headers(response):
 
 @app.route('/status', methods=['GET'])
 def status():
-    """Daemon status + WA login state."""
-    global _driver
-    driver_alive = False
-    logged_in = False
+    """Daemon status + WA login state. Stays responsive during a bulk job by
+    falling back to the last-known state when the worker channel is busy."""
+    driver_alive = _last_known['driver_alive']
+    logged_in = _last_known['wa_logged_in']
     try:
-        if _driver is not None:
-            _ = _driver.current_url
-            driver_alive = True
-            logged_in = is_logged_in(_driver, timeout_s=1)
+        st = worker.try_call({'cmd': 'status'}, timeout=10)
+        driver_alive = bool(st.get('driver_alive'))
+        logged_in = bool(st.get('wa_logged_in'))
+        _last_known['driver_alive'] = driver_alive
+        _last_known['wa_logged_in'] = logged_in
+    except WorkerBusy:
+        # A job is using the worker — report cached state instead of blocking.
+        pass
     except Exception:
         pass
 
@@ -1558,10 +682,15 @@ def status():
 def open_whatsapp():
     """Open Chrome Test with WhatsApp (for first-time QR scan)."""
     try:
-        driver = get_driver()
+        result = worker.call({'cmd': 'ensure_chrome_open'}, timeout=RPC_TIMEOUT_LOGIN)
+        if not result.get('success'):
+            return jsonify({'success': False, 'error': result.get('error', 'unknown'),
+                            'trace': result.get('trace', '')}), 500
+        _last_known['driver_alive'] = True
+        _last_known['wa_logged_in'] = bool(result.get('logged_in'))
         return jsonify({
             'success': True,
-            'logged_in': is_logged_in(driver, timeout_s=2)
+            'logged_in': bool(result.get('logged_in'))
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
@@ -1628,7 +757,7 @@ def bulk_send():
             'started_at': time.time()
         }
 
-        def worker():
+        def worker_thread():
             try:
                 run_bulk_job(job_id, employees, template, attachment_path,
                              delay_min, delay_max,
@@ -1645,7 +774,7 @@ def bulk_send():
             finally:
                 _job_lock.release()
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker_thread, daemon=True)
         _jobs[job_id]['thread'] = t
         t.start()
 
@@ -1757,31 +886,32 @@ def resume_job(job_id):
 @app.route('/selectors', methods=['GET'])
 def get_selectors():
     """Return current XPath/CSS selectors so user can inspect/edit."""
-    return jsonify({
-        'selectors': SELECTORS,
-        'config_file': CONFIG_FILE,
-        'note': ('To update selectors when WA Web changes, edit config.json '
-                 'and add a "selectors" object. The daemon merges it with defaults.')
-    })
+    try:
+        result = worker.call({'cmd': 'get_selectors'}, timeout=RPC_TIMEOUT_DEFAULT)
+        return jsonify({
+            'selectors': result.get('selectors', {}),
+            'config_file': result.get('config_file', CONFIG_FILE),
+            'note': ('To update selectors when WA Web changes, edit config.json '
+                     'and add a "selectors" object. The daemon merges it with defaults.')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/selectors', methods=['POST'])
 def update_selectors():
     """Update XPath/CSS selectors at runtime + persist to config.json."""
-    global SELECTORS
     try:
         data = request.get_json(force=True)
         new_sel = data.get('selectors', {})
         if not isinstance(new_sel, dict):
             return jsonify({'error': 'selectors must be a dict'}), 400
-        # Merge with current
-        SELECTORS.update(new_sel)
-        # Persist
-        cfg = load_config()
-        cfg['selectors'] = SELECTORS
-        save_config(cfg)
+        result = worker.call({'cmd': 'set_selectors', 'selectors': new_sel},
+                             timeout=RPC_TIMEOUT_DEFAULT)
+        if not result.get('success'):
+            return jsonify({'error': result.get('error', 'update failed')}), 500
         log(f'selectors updated: {list(new_sel.keys())}')
-        return jsonify({'success': True, 'selectors': SELECTORS})
+        return jsonify({'success': True, 'selectors': result.get('selectors', {})})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1794,69 +924,15 @@ def diagnostics():
     The user is expected to be on a chat with text input visible for full test.
     """
     try:
-        driver = get_driver()
-        if not is_logged_in(driver):
-            return jsonify({'error': 'WhatsApp not logged in'}), 400
-
-        results = []
-        # Test each selector pair
-        base_names = sorted(set(
-            k.replace('_Alt', '') for k in SELECTORS.keys()
-        ))
-        for base in base_names:
-            primary, alt = get_selector_pair(base)
-            primary_found = False
-            alt_found = False
-            tag_info = ''
-            try:
-                if primary:
-                    by, value = _xpath_or_css(driver, primary)
-                    elements = driver.find_elements(by, value)
-                    if elements:
-                        primary_found = True
-                        try:
-                            tag = elements[0].tag_name
-                            cls = (elements[0].get_attribute('class') or '')[:80]
-                            tag_info = f'<{tag}> class="{cls}"'
-                        except Exception:
-                            pass
-            except Exception as e:
-                tag_info = f'error: {e}'
-            try:
-                if alt and alt != primary:
-                    by, value = _xpath_or_css(driver, alt)
-                    if driver.find_elements(by, value):
-                        alt_found = True
-            except Exception:
-                pass
-
-            results.append({
-                'name': base,
-                'primary': primary,
-                'primary_found': primary_found,
-                'alt': alt,
-                'alt_found': alt_found,
-                'tag_info': tag_info,
-            })
-
-        # Get WA Web version
-        wa_version = ''
-        try:
-            wa_version = driver.execute_script(
-                "return window.Debug && window.Debug.VERSION ? window.Debug.VERSION : 'unknown';"
-            )
-        except Exception:
-            pass
-
+        result = worker.call({'cmd': 'diagnostics'}, timeout=RPC_TIMEOUT_LOGIN)
+        if result.get('code') == 400:
+            return jsonify({'error': result.get('error', 'WhatsApp not logged in')}), 400
+        if not result.get('ok', False) and result.get('error'):
+            return jsonify({'error': result.get('error'), 'trace': result.get('trace', '')}), 500
         return jsonify({
-            'wa_web_version': wa_version,
-            'results': results,
-            'summary': {
-                'total': len(results),
-                'primary_ok': sum(1 for r in results if r['primary_found']),
-                'alt_ok': sum(1 for r in results if r['alt_found']),
-                'either_ok': sum(1 for r in results if r['primary_found'] or r['alt_found']),
-            }
+            'wa_web_version': result.get('wa_web_version', ''),
+            'results': result.get('results', []),
+            'summary': result.get('summary', {}),
         })
     except Exception as e:
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
@@ -1865,22 +941,32 @@ def diagnostics():
 @app.route('/shutdown', methods=['POST'])
 def shutdown():
     """Gracefully close Chrome Test and shut down the daemon."""
-    shutdown_driver()
-    # Flask dev server shutdown
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func:
-        func()
+    try:
+        worker.stop()  # tells worker to quit the driver, then terminates it
+    except Exception as e:
+        log(f'worker shutdown error: {e}')
+    # Shut down the werkzeug server from a background thread so this request can
+    # return cleanly first.
+    srv = _server
+    if srv is not None:
+        threading.Thread(target=lambda: (time.sleep(0.3), srv.shutdown()),
+                         daemon=True).start()
     return jsonify({'success': True})
 
 
 # ─── Main ───────────────────────────────────────────────────────────
+_server = None  # werkzeug server instance (set in main, used by /shutdown)
+
+
 def main():
+    global _server
     log('=' * 60)
     log('ARAD Bulk WhatsApp Sender Daemon')
     log('=' * 60)
     log(f'Chrome Test:   {CHROME_PATH}')
     log(f'Profile:       {PROFILE_DIR}')
     log(f'ChromeDriver:  {CHROMEDRIVER_PATH}')
+    log(f'Worker script: {WORKER_SCRIPT}')
     log(f'Log file:      {LOG_FILE}')
     log(f'Listening on:  http://127.0.0.1:8766')
     log('=' * 60)
@@ -1891,13 +977,37 @@ def main():
     if not os.path.exists(CHROMEDRIVER_PATH):
         log(f'⚠ ChromeDriver not found at: {CHROMEDRIVER_PATH}')
         log('  Run install.ps1 to download it automatically')
+    if not os.path.exists(WORKER_SCRIPT):
+        log(f'⚠ Worker script not found at: {WORKER_SCRIPT}')
+        log('  The daemon cannot drive Chrome without it - reinstall.')
+
+    # Spawn the worker subprocess up-front (cheap - no Chrome yet). Chrome opens
+    # on demand when /open_whatsapp or the first bulk send arrives.
+    try:
+        log('starting driver worker subprocess...')
+        worker.start()
+        # Confirm the worker is alive and answering on the RPC channel.
+        worker.call({'cmd': 'ping'}, timeout=15)
+        log('worker ready')
+    except Exception as e:
+        log(f'worker startup failed (will retry on first request): {e}')
 
     try:
-        app.run(host='127.0.0.1', port=8766, debug=False, threaded=True, use_reloader=False)
+        from werkzeug.serving import make_server
+        # threaded=True so SSE progress streams don't block control endpoints
+        # (/stop, /pause, /status) and concurrent requests. The Selenium "session
+        # not created" bug that previously forced single-threaded mode is gone:
+        # all driver work happens in the isolated worker process now.
+        _server = make_server('127.0.0.1', 8766, app, threaded=True)
+        log('serving via werkzeug.make_server (threaded)')
+        _server.serve_forever()
     except KeyboardInterrupt:
         log('shutting down...')
     finally:
-        shutdown_driver()
+        try:
+            worker.stop()
+        except Exception:
+            pass
         log('daemon stopped')
 
 

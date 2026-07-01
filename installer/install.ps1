@@ -418,6 +418,40 @@ function Step-ChromeForTesting($idx, $total) {
 function Step-Daemon($idx, $total, $cft) {
     Write-Step $idx $total 'Installing Bulk Sender Daemon...'
 
+    # ─── DEFENSIVE PRE-INSTALL CLEANUP ──────────────────────────────
+    # A stale daemon process holds old config in memory + a stale .pyc takes
+    # precedence over the new .py. The daemon now ALSO spawns a child Selenium
+    # worker (arad_driver_worker.py) - we must kill BOTH so the file copy isn't
+    # blocked and the new code actually takes effect.
+
+    # 1. Kill any running daemon on port 8766
+    try {
+        $conns = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue
+        foreach ($c in $conns) {
+            Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
+            Write-Info "killed PID $($c.OwningProcess) (was on port 8766)"
+        }
+    } catch {}
+
+    # 2. Kill any python process running OUR daemon OR its driver worker
+    #    (the daemon spawns arad_driver_worker.py as a child subprocess).
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like "*arad_bulk_daemon*" -or $_.CommandLine -like "*arad_driver_worker*" } |
+            ForEach-Object {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                Write-Info "killed PID $($_.ProcessId) (daemon/worker)"
+            }
+    } catch {}
+    Start-Sleep -Seconds 1
+
+    # 3. Remove stale __pycache__ (old bytecode wins over new .py if not deleted)
+    $cache = "$DAEMON_BASE\__pycache__"
+    if (Test-Path $cache) {
+        Remove-Item $cache -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Info 'removed stale __pycache__'
+    }
+
     New-Item -Path $DAEMON_BASE -ItemType Directory -Force | Out-Null
     $profileDir = "$DAEMON_BASE\profile"
     New-Item -Path $profileDir -ItemType Directory -Force | Out-Null
@@ -432,6 +466,30 @@ function Step-Daemon($idx, $total, $cft) {
 
     Copy-Item $daemonSrc $daemonDest -Force
     Write-Ok "arad_bulk_daemon.py copied to $DAEMON_BASE"
+
+    # The daemon spawns arad_driver_worker.py (the isolated Selenium subprocess)
+    # as a sibling file, so it MUST be deployed alongside the daemon.
+    $workerSrc  = "$REPO_ROOT\daemon\arad_driver_worker.py"
+    $workerDest = "$DAEMON_BASE\arad_driver_worker.py"
+    if (-not (Test-Path $workerSrc)) {
+        Write-Err "driver worker source missing: $workerSrc"
+        exit 1
+    }
+    Copy-Item $workerSrc $workerDest -Force
+    Write-Ok "arad_driver_worker.py copied to $DAEMON_BASE"
+
+    # Sanity-check the copied daemon + worker — fail fast if Python can't parse them
+    try {
+        $pyExe = (Find-Python).Exe
+        $compileResult = & $pyExe -c "import py_compile; py_compile.compile(r'$daemonDest', doraise=True); py_compile.compile(r'$workerDest', doraise=True); print('OK')" 2>&1
+        if ($LASTEXITCODE -ne 0 -or $compileResult -notmatch 'OK') {
+            Write-Err "daemon failed Python compile check: $compileResult"
+            exit 1
+        }
+        Write-Info 'daemon + worker pass Python compile check'
+    } catch {
+        Write-Warn "compile check skipped: $_"
+    }
 
     # config.json - paths must NOT contain Hebrew characters (PowerShell encoding bug)
     $config = @{
