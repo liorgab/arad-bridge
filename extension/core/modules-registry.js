@@ -240,7 +240,9 @@ export const CORE = {
   // ARAD app domains where we inject window.__aradBridge
   host_permissions: [
     'https://arad-admin.vercel.app/*',
-    'https://*.vercel.app/*'  // preview URLs
+    'https://*.vercel.app/*',  // preview URLs
+    'http://127.0.0.1/*',      // local dev server (any port)
+    'http://localhost/*'
   ],
 
   content_scripts: [
@@ -248,7 +250,9 @@ export const CORE = {
       file: 'core/content-arad.js',
       matches: [
         'https://arad-admin.vercel.app/*',
-        'https://*.vercel.app/*'
+        'https://*.vercel.app/*',
+        'http://127.0.0.1/*',
+        'http://localhost/*'
       ],
       run_at: 'document_start'
     }
