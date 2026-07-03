@@ -194,7 +194,14 @@
         }
       };
       return () => es.close();  // unsubscribe fn
-    })
+    }),
+
+    // ─── PDF Generator module ─────────────────────────────────
+    // Render self-contained HTML → a real-text PDF (base64) via the daemon's
+    // headless Chrome. Returns { success, pdf_base64 } | { success:false, error }.
+    renderHtmlToPdf: gated('pdf', (html, options = null) =>
+      sendRequest('PDF_RENDER', { payload: { html, options } })
+    )
   };
 
   // Freeze top-level (methods can still be called, but the object can't be mutated)

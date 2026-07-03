@@ -46,19 +46,22 @@ import pibaHandler,           { getHealth as pibaHealth }     from './modules/pi
 import hoponHandler,          { getHealth as hoponHealth }    from './modules/hopon/handler.js';
 import waSingleHandler,       { getHealth as waSingleHealth } from './modules/whatsapp-single/handler.js';
 import waBulkHandler,         { getHealth as waBulkHealth }   from './modules/whatsapp-bulk/handler.js';
+import pdfHandler,            { getHealth as pdfHealth }      from './modules/pdf-render/handler.js';
 
 const HANDLERS = {
   piba:            pibaHandler,
   hopon:           hoponHandler,
   whatsapp_single: waSingleHandler,
-  whatsapp_bulk:   waBulkHandler
+  whatsapp_bulk:   waBulkHandler,
+  pdf:             pdfHandler
 };
 
 const HEALTH_CHECKS = {
   piba:            pibaHealth,
   hopon:           hoponHealth,
   whatsapp_single: waSingleHealth,
-  whatsapp_bulk:   waBulkHealth
+  whatsapp_bulk:   waBulkHealth,
+  pdf:             pdfHealth
 };
 
 function getHandler(moduleId) {
@@ -262,4 +265,4 @@ chrome.runtime.onStartup.addListener(async () => {
   console.log('[ARAD Bridge] Service worker started');
 });
 
-console.log('[ARAD Bridge] Background service worker loaded with 4 module handlers');
+console.log('[ARAD Bridge] Background service worker loaded with 5 module handlers');

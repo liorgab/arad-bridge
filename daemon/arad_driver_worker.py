@@ -31,6 +31,7 @@ import sys
 import json
 import time
 import re
+import pathlib
 import tempfile
 import traceback
 import subprocess
@@ -296,6 +297,162 @@ def shutdown_driver():
         except Exception as e:
             log(f'driver close error: {e}')
         _driver = None
+
+
+# ─── PDF renderer (dedicated headless driver, isolated from WhatsApp) ─
+# HTML → PDF via Chrome DevTools Protocol Page.printToPDF. This produces a
+# REAL vector-text PDF (selectable Hebrew/RTL text, tiny file) — NOT a raster
+# screenshot like the client-side html2canvas+jsPDF path. See
+# docs/modules/pdf-generator/SPEC.md.
+#
+# We use a SEPARATE headless driver (_pdf_driver) with its OWN profile so PDF
+# rendering never touches the logged-in WhatsApp session (`_driver`). The worker
+# process is single-threaded and never runs Flask, so creating a second
+# webdriver.Chrome() here is safe (same reason the WA driver is safe).
+_pdf_driver = None
+_pdf_profile_parent = os.path.dirname(PROFILE_DIR) or tempfile.gettempdir()
+PDF_PROFILE_DIR = os.path.join(_pdf_profile_parent, 'pdf_profile')
+
+
+def get_pdf_driver():
+    """Get or create the dedicated headless Chrome for PDF rendering."""
+    global _pdf_driver
+    if _pdf_driver is not None:
+        try:
+            _ = _pdf_driver.current_url  # ping
+            return _pdf_driver
+        except Exception as e:
+            log(f'pdf driver dead: {e}, recreating')
+            try:
+                _pdf_driver.quit()
+            except Exception:
+                pass
+            _pdf_driver = None
+
+    os.makedirs(PDF_PROFILE_DIR, exist_ok=True)
+    log(f'launching headless Chrome for PDF (profile: {PDF_PROFILE_DIR})')
+
+    options = Options()
+    options.binary_location = CHROME_PATH
+    options.add_argument('--headless=new')
+    options.add_argument(f'--user-data-dir={PDF_PROFILE_DIR}')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-dev-shm-usage')
+    # Allow the rendered file:// document to reference local resources if any.
+    options.add_argument('--allow-file-access-from-files')
+
+    service = Service(CHROMEDRIVER_PATH, log_output=subprocess.DEVNULL)
+    _pdf_driver = webdriver.Chrome(service=service, options=options)
+    log('pdf headless driver created')
+    return _pdf_driver
+
+
+def shutdown_pdf_driver():
+    global _pdf_driver
+    if _pdf_driver is not None:
+        try:
+            _pdf_driver.quit()
+            log('pdf driver closed')
+        except Exception as e:
+            log(f'pdf driver close error: {e}')
+        _pdf_driver = None
+
+
+def _wait_for_render(driver, timeout_s=15):
+    """Wait until the document is fully laid out and web-fonts are ready, so the
+    printToPDF snapshot captures embedded @font-face fonts (critical for Hebrew).
+    """
+    end = time.time() + timeout_s
+    while time.time() < end:
+        try:
+            if driver.execute_script("return document.readyState") == 'complete':
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+    try:
+        driver.set_script_timeout(min(timeout_s, 10))
+        # Resolve document.fonts.ready, then wait two animation frames so layout
+        # + font swap have painted before we snapshot.
+        driver.execute_async_script("""
+            const done = arguments[arguments.length - 1];
+            const ready = (document.fonts && document.fonts.ready)
+                ? document.fonts.ready : Promise.resolve();
+            ready.then(() => requestAnimationFrame(
+                () => requestAnimationFrame(() => done(true))
+            )).catch(() => done(true));
+        """)
+    except Exception as e:
+        log(f'pdf render font-wait skipped: {e}')
+
+
+# Paper sizes in inches (Page.printToPDF units).
+_PDF_PAPER_SIZES = {'A4': (8.27, 11.69), 'LETTER': (8.5, 11.0)}
+
+
+def _build_print_params(opts):
+    """Map PdfRenderOptions (see SPEC §1.2) to CDP Page.printToPDF params.
+    printToPDF uses INCHES for paper size + margins; we accept margins in mm."""
+    opts = opts or {}
+    fmt = str(opts.get('format') or 'A4').upper()
+    pw, ph = _PDF_PAPER_SIZES.get(fmt, _PDF_PAPER_SIZES['A4'])
+    margins = opts.get('margins_mm') or {}
+
+    def mm_to_in(val, default_mm):
+        v = val if val is not None else default_mm
+        try:
+            return float(v) / 25.4
+        except (TypeError, ValueError):
+            return default_mm / 25.4
+
+    params = {
+        'landscape': bool(opts.get('landscape', False)),
+        'printBackground': bool(opts.get('print_background', True)),
+        'preferCSSPageSize': bool(opts.get('prefer_css_page_size', True)),
+        'paperWidth': pw,
+        'paperHeight': ph,
+        'marginTop': mm_to_in(margins.get('top'), 10),
+        'marginBottom': mm_to_in(margins.get('bottom'), 10),
+        'marginLeft': mm_to_in(margins.get('left'), 10),
+        'marginRight': mm_to_in(margins.get('right'), 10),
+        'scale': float(opts.get('scale', 1.0) or 1.0),
+    }
+    header = opts.get('header_html')
+    footer = opts.get('footer_html')
+    if header or footer:
+        params['displayHeaderFooter'] = True
+        params['headerTemplate'] = header or '<span></span>'
+        params['footerTemplate'] = footer or '<span></span>'
+    return params
+
+
+def render_html_to_pdf(html, options):
+    """Render a self-contained HTML string to a real-text PDF (base64).
+
+    Loads the HTML from a temp file:// (reliable for large docs + @font-face),
+    waits for fonts/layout, then CDP Page.printToPDF. Returns base64 string.
+    """
+    driver = get_pdf_driver()
+    tmp_dir = os.path.join(tempfile.gettempdir(), 'arad_pdf')
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, f'render_{int(time.time() * 1000)}.html')
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    try:
+        driver.get(pathlib.Path(tmp_path).as_uri())
+        _wait_for_render(driver, timeout_s=15)
+        params = _build_print_params(options)
+        result = driver.execute_cdp_cmd('Page.printToPDF', params)
+        b64 = result.get('data')
+        if not b64:
+            raise Exception('printToPDF returned no data')
+        return b64
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 # ─── WhatsApp helpers ───────────────────────────────────────────────
@@ -1341,8 +1498,25 @@ def cmd_diagnostics(req):
     return dict(ok=True, **run_diagnostics(driver))
 
 
+def cmd_render_pdf(req):
+    """Render self-contained HTML → real-text PDF (base64) via CDP printToPDF.
+    Uses the dedicated headless driver — never touches the WhatsApp session."""
+    html = req.get('html', '')
+    if not html:
+        return {'ok': True, 'success': False, 'error': 'empty html'}
+    try:
+        b64 = render_html_to_pdf(html, req.get('options', {}))
+        log(f'rendered PDF: {len(b64)} base64 chars')
+        return {'ok': True, 'success': True, 'pdf_base64': b64}
+    except Exception as e:
+        log(f'render_pdf failed: {e}')
+        return {'ok': True, 'success': False, 'error': str(e)[:300],
+                'trace': traceback.format_exc()}
+
+
 def cmd_shutdown(req):
     shutdown_driver()
+    shutdown_pdf_driver()
     return {'ok': True, 'success': True, '_exit': True}
 
 
@@ -1354,6 +1528,7 @@ HANDLERS = {
     'wait_for_login': cmd_wait_for_login,
     'prepare_bulk': cmd_prepare_bulk,
     'send_message': cmd_send_message,
+    'render_pdf': cmd_render_pdf,
     'get_selectors': cmd_get_selectors,
     'set_selectors': cmd_set_selectors,
     'diagnostics': cmd_diagnostics,
@@ -1419,6 +1594,7 @@ def main():
             break
 
     shutdown_driver()
+    shutdown_pdf_driver()
     log('worker exiting')
 
 

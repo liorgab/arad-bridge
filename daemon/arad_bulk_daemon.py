@@ -35,6 +35,7 @@ Endpoints (unchanged contract — the extension depends on these):
   GET  /status              daemon status + driver/login state
   POST /open_whatsapp       open Chrome Test + WhatsApp (first-time QR scan)
   POST /bulk_send           start a bulk job, returns {job_id}
+  POST /render_pdf          HTML → real-text PDF (base64) via headless printToPDF
   GET  /progress/<id>       SSE stream of progress events
   POST /stop/<id>           stop a running job
   POST /pause/<id>          pause a running job
@@ -102,6 +103,7 @@ PER_MINUTE_CAP = 3
 RPC_TIMEOUT_DEFAULT = 30
 RPC_TIMEOUT_SEND = 120
 RPC_TIMEOUT_LOGIN = 200
+RPC_TIMEOUT_PDF = 60         # HTML→PDF render (headless Chrome first-launch + print)
 
 
 # ─── Logging ────────────────────────────────────────────────────────
@@ -881,6 +883,47 @@ def resume_job(job_id):
     log(f'   pause_event CLEARED for {job_id} (was_paused={was_paused})')
     return jsonify({'success': True, 'job_id': job_id, 'action': 'resume',
                     'was_paused': was_paused})
+
+
+@app.route('/render_pdf', methods=['POST'])
+def render_pdf():
+    """Render self-contained HTML → a real-text PDF (base64), via the worker's
+    dedicated headless Chrome + CDP Page.printToPDF. Does NOT touch the WhatsApp
+    session. See docs/modules/pdf-generator/SPEC.md.
+
+    Request:  { html: string, options?: PdfRenderOptions }
+    Response: { success: true, pdf_base64 } | { success: false, error, error_code }
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'bad json: {e}',
+                        'error_code': 'RENDER_FAILED'}), 400
+
+    html = (data or {}).get('html', '')
+    options = (data or {}).get('options', {})
+    if not html:
+        return jsonify({'success': False, 'error': 'empty html',
+                        'error_code': 'RENDER_FAILED'}), 400
+
+    try:
+        result = worker.call({'cmd': 'render_pdf', 'html': html, 'options': options},
+                             timeout=RPC_TIMEOUT_PDF)
+        if not result.get('success'):
+            return jsonify({'success': False,
+                            'error': result.get('error', 'render failed'),
+                            'error_code': 'RENDER_FAILED',
+                            'trace': result.get('trace', '')}), 500
+        _last_known['driver_alive'] = True
+        return jsonify({'success': True, 'pdf_base64': result.get('pdf_base64')})
+    except WorkerError as e:
+        # Timeout or worker death — the WA session is unaffected (separate driver).
+        code = 'TIMEOUT' if 'timeout' in str(e).lower() else 'RENDER_FAILED'
+        return jsonify({'success': False, 'error': str(e), 'error_code': code}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e),
+                        'error_code': 'RENDER_FAILED',
+                        'trace': traceback.format_exc()}), 500
 
 
 @app.route('/selectors', methods=['GET'])

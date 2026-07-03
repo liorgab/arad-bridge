@@ -186,6 +186,44 @@ export const MODULES = {
       installer_size_mb: 250,
       check_url: 'http://127.0.0.1:8766/status'
     }
+  },
+
+  // ─── PDF Generator — HTML → real-text PDF via the daemon ───────
+  pdf: {
+    id: 'pdf',
+    name: 'מחולל PDF',
+    description: 'המרת HTML מעוצב ל-PDF תיקני (טקסט וקטורי אמיתי, עברית/RTL, ריבוי-עמודים) דרך headless Chrome ב-Daemon. לא צילום-מסך.',
+    icon: 'icons/module-pdf.svg',
+    version: '1.0.0',
+    category: 'documents',
+    sku: 'PDF_GEN_001',
+    required: false,
+
+    host_permissions: [
+      'http://127.0.0.1:8766/*',
+      'http://localhost:8766/*'
+    ],
+
+    // No content scripts — talks only to the local daemon over HTTP.
+    content_scripts: [],
+
+    handler: 'modules/pdf-render/handler.js',
+    message_types: [
+      'PDF_RENDER'
+    ],
+
+    api: [
+      { method: 'renderHtmlToPdf', message: 'PDF_RENDER' }
+    ],
+
+    requires_external: {
+      type: 'daemon',
+      name: 'ARAD Bulk Daemon',
+      port: 8766,
+      download_url: 'https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe',
+      installer_size_mb: 250,
+      check_url: 'http://127.0.0.1:8766/status'
+    }
   }
 };
 
