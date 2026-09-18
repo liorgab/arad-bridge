@@ -16,22 +16,15 @@
 //  extension can (chrome.tabs). That is why TOWER routes the click here when
 //  the bridge is installed (and falls back to a plain named tab if not).
 //
-//  Tab policy: navigate the tab that RUNS the app (/webui/<tenant>/…) —
-//  never the login page, which shares the host but has no session — and
-//  create a tab only if no app tab exists (first open → one login, then the
-//  tab is reused). Only https://p.priority-connect.online/* URLs are accepted
+//  Tab policy: EVERY open gets its own fresh tab — nothing is closed or
+//  navigated in place, so previously opened documents stay open (Lior's
+//  preference). A fresh tab is also the proven no-login path: with the JWT
+//  in the URL the app's bootstrap loads the form directly, and two such tabs
+//  coexist fine. Only https://p.priority-connect.online/* URLs are accepted
 //  — the page must never drive arbitrary navigation through the bridge.
 // ═══════════════════════════════════════════════════════════════════
 
 const PRIORITY_ORIGIN    = 'https://p.priority-connect.online';
-const PRIORITY_MATCH     = `${PRIORITY_ORIGIN}/*`;
-// The RUNNING Priority Web app lives under /webui/<tenant>/. Its OIDC user
-// (access token) is kept in that tab's sessionStorage, so navigating THIS tab
-// lets the app's bootstrap find a valid user (getUser()) and load the form
-// WITHOUT re-authenticating. Any other Priority tab — above all the login
-// page (/accounts/login…, same host!) — has NO session; navigating it just
-// re-runs the login. Picking the wrong tab was exactly the bug in v2.3.0.
-const PRIORITY_APP_MATCH = `${PRIORITY_ORIGIN}/webui/*`;
 // Default when called with no url (e.g. the popup's "open Priority" button).
 // NOT the host root — https://p.priority-connect.online/ is a 404. /webui/ is
 // the app's tenant-less entry (logs in / picks the tenant as needed).
@@ -72,34 +65,14 @@ function withJwt(url, token) {
 function isAllowedUrl(url) {
   return typeof url === 'string' && url.startsWith(PRIORITY_ORIGIN + '/');
 }
-function isLoginTab(t) {
-  return /\/accounts\//.test((t && t.url) || '');
-}
-
-async function findPriorityTab() {
-  try {
-    // 1) Prefer the running app tab (holds the session). Active one first.
-    const app = await chrome.tabs.query({ url: PRIORITY_APP_MATCH });
-    const appTab = app.find(t => t.active) || app[0];
-    if (appTab) return appTab;
-    // 2) Otherwise any Priority tab that is NOT the login page.
-    const others = (await chrome.tabs.query({ url: PRIORITY_MATCH })).filter(t => !isLoginTab(t));
-    return others.find(t => t.active) || others[0] || null;
-  } catch (e) {
-    console.warn('[ARAD Bridge/Priority] tabs.query failed:', e);
-    return null;
-  }
-}
 
 // ─── OPEN_PRIORITY ────────────────────────────────────────────────
-// Tab policy (observed 2026-09-18): opening the JWT deep-link in a FRESH tab
-// loads the form with no login, but navigating the ALREADY-RUNNING app tab
-// to the same URL (chrome.tabs.update) re-ran the login — Priority_Scripts.js
-// runs its own authenticate()/getUser() pass on load and behaves differently
-// on a tab that already holds the previous app run's storage. So we never
-// reuse the app tab: we close it and open a fresh one (exactly the
-// "close all Priority tabs, then click" case that works), keeping a single
-// Priority tab for the user.
+// Always a FRESH tab (observed 2026-09-18): with the JWT in the URL a new tab
+// loads the form with no login, whereas navigating an ALREADY-RUNNING app tab
+// in place (chrome.tabs.update) re-ran the login — Priority_Scripts.js runs
+// its own authenticate()/getUser() pass on load and behaves differently on a
+// tab that still holds the previous run's storage. We never navigate or close
+// existing tabs: each open is its own tab and earlier documents stay open.
 async function openPriority(msg) {
   const plainUrl = msg?.url || (await getHome());
   if (!isAllowedUrl(plainUrl)) {
@@ -118,25 +91,12 @@ async function openPriority(msg) {
   const via = token ? 'jwt' : 'plain';
 
   try {
-    const old = await findPriorityTab();
-    let closed_tab_url = null;
-    if (old && old.id != null) {
-      closed_tab_url = old.url;
-      // Close first (may show the app's own "leave site?" prompt if it has
-      // unsaved changes — same prompt the user saw with in-place navigation).
-      // Don't block on it: create the fresh tab either way.
-      chrome.tabs.remove(old.id).catch(() => { /* user may cancel the prompt */ });
-      await new Promise(r => setTimeout(r, 250));
-    }
+    // Every click → its own fresh tab. Previously opened documents stay open
+    // (Lior's preference, 2026-09-18); nothing is closed or navigated in place.
+    // A fresh tab is also the proven no-login path (empty sessionStorage +
+    // JWT), and two JWT tabs coexist fine (seen when a bug once opened two).
     const tab = await chrome.tabs.create({ url, active: true });
-    return {
-      success: true,
-      tab_id: tab.id,
-      tab_url: plainUrl,
-      mode: closed_tab_url ? 'replaced' : 'created',
-      closed_tab_url,
-      via
-    };
+    return { success: true, tab_id: tab.id, tab_url: plainUrl, mode: 'created', via };
   } catch (e) {
     return { success: false, error_code: 'TAB_ERROR', error: e.message };
   }

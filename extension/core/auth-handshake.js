@@ -74,7 +74,7 @@ export async function handleHandshake(payload) {
 
   return {
     success: true,
-    version: '2.4.2',
+    version: '2.4.3',
     active_modules: effective,
     requested_modules: enabled_modules,
     unknown_modules: unknown,

@@ -19,7 +19,7 @@
     return;
   }
 
-  const VERSION = '2.4.2';
+  const VERSION = '2.4.3';
   const TIMEOUT_MS = 60_000;
 
   // Local cache of enabled modules — refreshed on every handshake.
