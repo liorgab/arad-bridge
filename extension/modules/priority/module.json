@@ -6,9 +6,15 @@
   "category": "erp",
   "sku": "PRIORITY_001",
   "author": "ARAD Team",
-  "host_permissions": [],
-  "content_scripts": [],
+  "host_permissions": ["https://p.priority-connect.online/*"],
+  "content_scripts": [
+    {
+      "file": "modules/priority/content.js",
+      "matches": ["https://p.priority-connect.online/webui/*"],
+      "run_at": "document_idle"
+    }
+  ],
   "handler": "modules/priority/handler.js",
   "message_types": ["OPEN_PRIORITY"],
-  "storage_keys": []
+  "storage_keys": ["priority_token", "priority_token_exp", "priority_token_updated_at"]
 }

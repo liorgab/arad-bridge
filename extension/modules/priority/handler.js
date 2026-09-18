@@ -33,7 +33,33 @@ const PRIORITY_MATCH     = `${PRIORITY_ORIGIN}/*`;
 // re-runs the login. Picking the wrong tab was exactly the bug in v2.3.0.
 const PRIORITY_APP_MATCH = `${PRIORITY_ORIGIN}/webui/*`;
 // Default when called with no url (e.g. the popup's "open Priority" button).
-const PRIORITY_HOME      = `${PRIORITY_ORIGIN}/`;
+// NOT the host root — https://p.priority-connect.online/ is a 404. /webui/ is
+// the app's tenant-less entry (logs in / picks the tenant as needed).
+const PRIORITY_HOME      = `${PRIORITY_ORIGIN}/webui/`;
+// Refuse a token that expires within this margin (silent renew is ~120s early).
+const TOKEN_MIN_TTL_MS   = 60_000;
+
+// ─── Token (synced from the app tab by modules/priority/content.js) ────
+// Priority Web's bootstrap supports "bring your own JWT":
+//   /webui/<tenant>/?jwt=<access_token>&<params…>
+// It sets window.oidc_access_token from that param and loads the UI directly —
+// no OIDC round-trip, so no login page. The query MUST START with ?jwt=
+// (the bootstrap checks location.search.startsWith("?jwt=")), and the rest of
+// the query (priority:priform&_disableplugin=1&_execute=…) is still appended to
+// priorityParams, so the requested form opens as usual.
+async function getValidToken() {
+  const { priority_token, priority_token_exp } =
+    await chrome.storage.local.get(['priority_token', 'priority_token_exp']);
+  if (!priority_token) return null;
+  if (priority_token_exp && (priority_token_exp - Date.now()) < TOKEN_MIN_TTL_MS) return null;
+  return priority_token;
+}
+function withJwt(url, token) {
+  const u = new URL(url);
+  const rest = u.search ? u.search.slice(1) : '';
+  u.search = '?jwt=' + encodeURIComponent(token) + (rest ? '&' + rest : '');
+  return u.toString();
+}
 
 function isAllowedUrl(url) {
   return typeof url === 'string' && url.startsWith(PRIORITY_ORIGIN + '/');
@@ -59,26 +85,31 @@ async function findPriorityTab() {
 
 // ─── OPEN_PRIORITY ────────────────────────────────────────────────
 async function openPriority(msg) {
-  const url = msg?.url || PRIORITY_HOME;
-  if (!isAllowedUrl(url)) {
+  const plainUrl = msg?.url || PRIORITY_HOME;
+  if (!isAllowedUrl(plainUrl)) {
     return {
       success: false,
       error_code: 'BAD_URL',
-      error: `Refusing to open a non-Priority URL: ${String(url).slice(0, 120)}`
+      error: `Refusing to open a non-Priority URL: ${String(plainUrl).slice(0, 120)}`
     };
   }
+
+  // With a valid synced token → "bring your own JWT" (no login). Without one
+  // (user never logged in / token expired) → plain URL: Priority shows its
+  // login ONCE, and the content script then captures the token for next time.
+  const token = await getValidToken();
+  const url = token ? withJwt(plainUrl, token) : plainUrl;
+  const via = token ? 'jwt' : 'plain';
 
   try {
     let tab = await findPriorityTab();
     if (tab && tab.id != null) {
-      // Reuse the existing Priority tab: browser-initiated navigation keeps
-      // the SameSite=Strict session cookie → no re-login.
       await chrome.tabs.update(tab.id, { url, active: true });
       try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* window may be gone */ }
-      return { success: true, tab_id: tab.id, tab_url: tab.url, mode: 'reused' };
+      return { success: true, tab_id: tab.id, tab_url: tab.url, mode: 'reused', via };
     }
     tab = await chrome.tabs.create({ url, active: true });
-    return { success: true, tab_id: tab.id, tab_url: url, mode: 'created' };
+    return { success: true, tab_id: tab.id, tab_url: plainUrl, mode: 'created', via };
   } catch (e) {
     return { success: false, error_code: 'TAB_ERROR', error: e.message };
   }
@@ -89,10 +120,34 @@ async function openPriority(msg) {
 // usable. We also report whether a Priority tab is currently open.
 export async function getHealth() {
   try {
-    const tab = await findPriorityTab();
-    return tab
-      ? { ok: true, status: 'CONNECTED', message: 'טאב Priority פתוח', detail: 'קישורים ממגדל ייפתחו בו ללא התחברות-מחדש' }
-      : { ok: true, status: 'READY',     message: 'מוכן',               detail: 'הלחיצה הראשונה ממגדל תפתח טאב Priority' };
+    const { priority_token, priority_token_exp, priority_token_updated_at } =
+      await chrome.storage.local.get(['priority_token', 'priority_token_exp', 'priority_token_updated_at']);
+    if (!priority_token) {
+      return {
+        ok: false,
+        status: 'NO_TOKEN',
+        message: 'אין טוקן',
+        hint: 'פתח את Priority והתחבר — הטוקן יסונכרן אוטומטית'
+      };
+    }
+    if (priority_token_exp && (priority_token_exp - Date.now()) < TOKEN_MIN_TTL_MS) {
+      return {
+        ok: false,
+        status: 'TOKEN_EXPIRED',
+        message: 'הטוקן פג',
+        hint: 'רענן את טאב Priority (או התחבר מחדש) — הטוקן יסונכרן'
+      };
+    }
+    const minutesAgo = Math.round((Date.now() - (priority_token_updated_at || 0)) / 60000);
+    const minutesLeft = priority_token_exp ? Math.round((priority_token_exp - Date.now()) / 60000) : null;
+    return {
+      ok: true,
+      status: 'CONNECTED',
+      message: 'טוקן מסונכרן',
+      detail: (minutesAgo > 0 ? `עודכן לפני ${minutesAgo} דקות` : 'עודכן הרגע')
+            + (minutesLeft != null ? ` · תקף עוד ${minutesLeft} דקות` : '')
+            + ' — קישורים ממגדל ייפתחו ללא התחברות'
+    };
   } catch (e) {
     return { ok: false, status: 'ERROR', message: e.message };
   }

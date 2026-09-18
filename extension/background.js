@@ -96,7 +96,7 @@ const coreHandlers = {
 
     return {
       installed: true,
-      version: '2.3.1',
+      version: '2.4.0',
       enabled_modules: enabled,
       customer,
 

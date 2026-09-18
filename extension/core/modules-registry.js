@@ -280,10 +280,21 @@ export const MODULES = {
     sku: 'PRIORITY_001',
     required: false,
 
-    host_permissions: [],
+    host_permissions: [
+      'https://p.priority-connect.online/*'
+    ],
 
-    // No content scripts — only navigates a tab through the tabs API.
-    content_scripts: [],
+    // Content script on the Priority Web app: syncs the app's OIDC access
+    // token (sessionStorage oidc.user:…) to chrome.storage, exactly like the
+    // HopOn module. The handler then opens deep-links with Priority's own
+    // "bring your own JWT" entry (/webui/<tenant>/?jwt=…) → no login page.
+    content_scripts: [
+      {
+        file: 'modules/priority/content.js',
+        matches: ['https://p.priority-connect.online/webui/*'],
+        run_at: 'document_idle'
+      }
+    ],
 
     handler: 'modules/priority/handler.js',
     message_types: [
