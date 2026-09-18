@@ -33,6 +33,19 @@
   // Run as early as possible
   injectBridge();
 
+  // ─── Idempotency guard ────────────────────────────────────────
+  // This script can end up executed more than once in the same page (static
+  // registration + a later executeScript). All content scripts of one
+  // extension share the isolated world per frame, so a flag set by the first
+  // instance is visible to the next. Without this, every ARAD_BRIDGE_REQUEST
+  // was relayed once PER INSTANCE → handlers ran twice in the background
+  // (two Priority tabs on first open, double converts, …).
+  if (window.__aradRelayInstalled) {
+    console.debug('[ARAD Bridge] content script already active on this page — skipping duplicate relay');
+    return;
+  }
+  window.__aradRelayInstalled = true;
+
   // ─── 2. Listen for requests from the page (main world) ────────
   window.addEventListener('message', async (event) => {
     if (event.source !== window) return;

@@ -74,7 +74,7 @@ export async function handleHandshake(payload) {
 
   return {
     success: true,
-    version: '2.4.1',
+    version: '2.4.2',
     active_modules: effective,
     requested_modules: enabled_modules,
     unknown_modules: unknown,
@@ -177,7 +177,14 @@ async function registerContentScriptsFor(enabledModuleIds) {
   // registerContentScripts only runs on FUTURE page loads. For tabs
   // already open (very common: user installs ARAD while PIBA is open),
   // we manually executeScript to sync tokens immediately, without F5.
-  for (const target of [...toAdd, ...toUpdate]) {
+  // Only NEWLY registered MODULE scripts (toAdd) — never Core, and never
+  // scripts that are merely being updated: Core is statically registered and
+  // already running in every ARAD tab (it is what sent this handshake), and
+  // re-executing a script that already runs in a tab duplicates its
+  // listeners/intervals. A duplicated Core relay made EVERY request reach the
+  // background twice (→ two Priority tabs on first open, double MPP converts…).
+  for (const target of toAdd) {
+    if (String(target.id).startsWith('arad_core_')) continue;
     try {
       const tabs = await chrome.tabs.query({ url: target.matches });
       for (const tab of tabs) {
