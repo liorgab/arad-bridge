@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ARAD Bridge",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "ARAD Bridge — Chrome Extension מודולרי למערכת ARAD לניהול עובדים זרים. תומך ב-PIBA, HopOn, WhatsApp Single, WhatsApp Bulk ומחולל PDF.",
   "author": "Lior Gabay",
 

@@ -5,40 +5,52 @@
 //  user's (single, shared) Priority tab.
 //
 //  WHY THIS EXISTS (the whole point of the module):
-//  TOWER links into Priority (openmail.htm priform deep-links). A normal
-//  <a href> click from TOWER is a CROSS-SITE navigation (tower.vercel.app →
-//  p.priority-connect.online). Priority's login-session cookie is
-//  SameSite=Strict, and browsers WITHHOLD Strict cookies on cross-site
-//  navigations — so Priority sees no session and bounces the user to the
-//  OIDC login page on EVERY click, even though they are logged in.
+//  Priority Web keeps its OIDC user (access token) in the app tab's
+//  sessionStorage (oidc-client-js default userStore) — i.e. PER TAB. Its
+//  bootstrap (bootstrapWebUISys.js) loads a form WITHOUT any login when
+//  oidc_mgr.getUser() yields a valid user, and only when there is none does
+//  it call signinRedirect() with prompt=login (forced re-auth). So a link
+//  opened in a NEW tab (empty sessionStorage) always hits the login page,
+//  while navigating the tab that is ALREADY running the app reuses its
+//  session. TOWER cannot target that specific tab from a web page; the
+//  extension can (chrome.tabs). That is why TOWER routes the click here when
+//  the bridge is installed (and falls back to a plain named tab if not).
 //
-//  A navigation started by the extension's chrome.tabs API is
-//  BROWSER-initiated (no web initiator), so the browser DOES send
-//  SameSite=Strict cookies → Priority recognizes the session → the document
-//  opens directly, no re-login. That is why TOWER routes the click through
-//  here when the bridge is installed (and falls back to a plain link if not).
-//
-//  Tab policy: reuse the one existing Priority tab (update its URL + focus)
-//  so the user keeps a single logged-in Priority tab; create one if absent.
-//  Only https://p.priority-connect.online/* URLs are accepted — the page
-//  must never be able to drive arbitrary navigation through the bridge.
+//  Tab policy: navigate the tab that RUNS the app (/webui/<tenant>/…) —
+//  never the login page, which shares the host but has no session — and
+//  create a tab only if no app tab exists (first open → one login, then the
+//  tab is reused). Only https://p.priority-connect.online/* URLs are accepted
+//  — the page must never drive arbitrary navigation through the bridge.
 // ═══════════════════════════════════════════════════════════════════
 
-const PRIORITY_ORIGIN = 'https://p.priority-connect.online';
-const PRIORITY_MATCH  = `${PRIORITY_ORIGIN}/*`;
+const PRIORITY_ORIGIN    = 'https://p.priority-connect.online';
+const PRIORITY_MATCH     = `${PRIORITY_ORIGIN}/*`;
+// The RUNNING Priority Web app lives under /webui/<tenant>/. Its OIDC user
+// (access token) is kept in that tab's sessionStorage, so navigating THIS tab
+// lets the app's bootstrap find a valid user (getUser()) and load the form
+// WITHOUT re-authenticating. Any other Priority tab — above all the login
+// page (/accounts/login…, same host!) — has NO session; navigating it just
+// re-runs the login. Picking the wrong tab was exactly the bug in v2.3.0.
+const PRIORITY_APP_MATCH = `${PRIORITY_ORIGIN}/webui/*`;
 // Default when called with no url (e.g. the popup's "open Priority" button).
-const PRIORITY_HOME   = `${PRIORITY_ORIGIN}/`;
+const PRIORITY_HOME      = `${PRIORITY_ORIGIN}/`;
 
 function isAllowedUrl(url) {
   return typeof url === 'string' && url.startsWith(PRIORITY_ORIGIN + '/');
 }
+function isLoginTab(t) {
+  return /\/accounts\//.test((t && t.url) || '');
+}
 
 async function findPriorityTab() {
   try {
-    const tabs = await chrome.tabs.query({ url: PRIORITY_MATCH });
-    // Prefer a tab in the currently focused window so focus() feels natural.
-    const current = tabs.find(t => t.active) || tabs[0];
-    return current || null;
+    // 1) Prefer the running app tab (holds the session). Active one first.
+    const app = await chrome.tabs.query({ url: PRIORITY_APP_MATCH });
+    const appTab = app.find(t => t.active) || app[0];
+    if (appTab) return appTab;
+    // 2) Otherwise any Priority tab that is NOT the login page.
+    const others = (await chrome.tabs.query({ url: PRIORITY_MATCH })).filter(t => !isLoginTab(t));
+    return others.find(t => t.active) || others[0] || null;
   } catch (e) {
     console.warn('[ARAD Bridge/Priority] tabs.query failed:', e);
     return null;
@@ -63,10 +75,10 @@ async function openPriority(msg) {
       // the SameSite=Strict session cookie → no re-login.
       await chrome.tabs.update(tab.id, { url, active: true });
       try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* window may be gone */ }
-      return { success: true, tab_id: tab.id, mode: 'reused' };
+      return { success: true, tab_id: tab.id, tab_url: tab.url, mode: 'reused' };
     }
     tab = await chrome.tabs.create({ url, active: true });
-    return { success: true, tab_id: tab.id, mode: 'created' };
+    return { success: true, tab_id: tab.id, tab_url: url, mode: 'created' };
   } catch (e) {
     return { success: false, error_code: 'TAB_ERROR', error: e.message };
   }
