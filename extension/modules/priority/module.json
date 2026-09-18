@@ -16,5 +16,5 @@
   ],
   "handler": "modules/priority/handler.js",
   "message_types": ["OPEN_PRIORITY"],
-  "storage_keys": ["priority_token", "priority_token_exp", "priority_token_updated_at"]
+  "storage_keys": ["priority_token", "priority_token_exp", "priority_token_updated_at", "priority_home"]
 }

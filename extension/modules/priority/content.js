@@ -70,6 +70,21 @@
     }
   }
 
+  // Remember the app's real home (/webui/<tenant>/) so the popup's
+  // "open Priority" button — and any open without a specific document — lands
+  // on the app, not on a guessed path. The extension is tenant-agnostic.
+  async function syncHome() {
+    try {
+      const m = /^\/webui\/[^/]+\/?/.exec(location.pathname);
+      if (!m) return;
+      const home = location.origin + m[0].replace(/\/?$/, '/');
+      await chrome.storage.local.set({ priority_home: home });
+    } catch (e) {
+      console.warn('[ARAD Bridge/Priority] Home sync failed', e);
+    }
+  }
+
+  syncHome();
   syncToken();
   setInterval(syncToken, SYNC_INTERVAL_MS);   // also picks up silent renews
 

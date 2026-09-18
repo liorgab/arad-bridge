@@ -39,6 +39,14 @@ const PRIORITY_HOME      = `${PRIORITY_ORIGIN}/webui/`;
 // Refuse a token that expires within this margin (silent renew is ~120s early).
 const TOKEN_MIN_TTL_MS   = 60_000;
 
+// The app's real home (/webui/<tenant>/) is synced by the content script from
+// the tab that runs it — the extension itself is tenant-agnostic. Falls back to
+// the tenant-less /webui/ entry.
+async function getHome() {
+  const { priority_home } = await chrome.storage.local.get(['priority_home']);
+  return (priority_home && isAllowedUrl(priority_home)) ? priority_home : PRIORITY_HOME;
+}
+
 // ─── Token (synced from the app tab by modules/priority/content.js) ────
 // Priority Web's bootstrap supports "bring your own JWT":
 //   /webui/<tenant>/?jwt=<access_token>&<params…>
@@ -84,8 +92,16 @@ async function findPriorityTab() {
 }
 
 // ─── OPEN_PRIORITY ────────────────────────────────────────────────
+// Tab policy (observed 2026-09-18): opening the JWT deep-link in a FRESH tab
+// loads the form with no login, but navigating the ALREADY-RUNNING app tab
+// to the same URL (chrome.tabs.update) re-ran the login — Priority_Scripts.js
+// runs its own authenticate()/getUser() pass on load and behaves differently
+// on a tab that already holds the previous app run's storage. So we never
+// reuse the app tab: we close it and open a fresh one (exactly the
+// "close all Priority tabs, then click" case that works), keeping a single
+// Priority tab for the user.
 async function openPriority(msg) {
-  const plainUrl = msg?.url || PRIORITY_HOME;
+  const plainUrl = msg?.url || (await getHome());
   if (!isAllowedUrl(plainUrl)) {
     return {
       success: false,
@@ -102,14 +118,25 @@ async function openPriority(msg) {
   const via = token ? 'jwt' : 'plain';
 
   try {
-    let tab = await findPriorityTab();
-    if (tab && tab.id != null) {
-      await chrome.tabs.update(tab.id, { url, active: true });
-      try { await chrome.windows.update(tab.windowId, { focused: true }); } catch { /* window may be gone */ }
-      return { success: true, tab_id: tab.id, tab_url: tab.url, mode: 'reused', via };
+    const old = await findPriorityTab();
+    let closed_tab_url = null;
+    if (old && old.id != null) {
+      closed_tab_url = old.url;
+      // Close first (may show the app's own "leave site?" prompt if it has
+      // unsaved changes — same prompt the user saw with in-place navigation).
+      // Don't block on it: create the fresh tab either way.
+      chrome.tabs.remove(old.id).catch(() => { /* user may cancel the prompt */ });
+      await new Promise(r => setTimeout(r, 250));
     }
-    tab = await chrome.tabs.create({ url, active: true });
-    return { success: true, tab_id: tab.id, tab_url: plainUrl, mode: 'created', via };
+    const tab = await chrome.tabs.create({ url, active: true });
+    return {
+      success: true,
+      tab_id: tab.id,
+      tab_url: plainUrl,
+      mode: closed_tab_url ? 'replaced' : 'created',
+      closed_tab_url,
+      via
+    };
   } catch (e) {
     return { success: false, error_code: 'TAB_ERROR', error: e.message };
   }
