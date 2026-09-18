@@ -47,13 +47,17 @@ import hoponHandler,          { getHealth as hoponHealth }    from './modules/ho
 import waSingleHandler,       { getHealth as waSingleHealth } from './modules/whatsapp-single/handler.js';
 import waBulkHandler,         { getHealth as waBulkHealth }   from './modules/whatsapp-bulk/handler.js';
 import pdfHandler,            { getHealth as pdfHealth }      from './modules/pdf-render/handler.js';
+import mppHandler,            { getHealth as mppHealth }      from './modules/mpp-convert/handler.js';
+import priorityHandler,       { getHealth as priorityHealth } from './modules/priority/handler.js';
 
 const HANDLERS = {
   piba:            pibaHandler,
   hopon:           hoponHandler,
   whatsapp_single: waSingleHandler,
   whatsapp_bulk:   waBulkHandler,
-  pdf:             pdfHandler
+  pdf:             pdfHandler,
+  mpp:             mppHandler,
+  priority:        priorityHandler
 };
 
 const HEALTH_CHECKS = {
@@ -61,7 +65,9 @@ const HEALTH_CHECKS = {
   hopon:           hoponHealth,
   whatsapp_single: waSingleHealth,
   whatsapp_bulk:   waBulkHealth,
-  pdf:             pdfHealth
+  pdf:             pdfHealth,
+  mpp:             mppHealth,
+  priority:        priorityHealth
 };
 
 function getHandler(moduleId) {
@@ -90,7 +96,7 @@ const coreHandlers = {
 
     return {
       installed: true,
-      version: '2.0.0',
+      version: '2.3.0',
       enabled_modules: enabled,
       customer,
 
@@ -265,4 +271,4 @@ chrome.runtime.onStartup.addListener(async () => {
   console.log('[ARAD Bridge] Service worker started');
 });
 
-console.log('[ARAD Bridge] Background service worker loaded with 5 module handlers');
+console.log('[ARAD Bridge] Background service worker loaded with 7 module handlers');

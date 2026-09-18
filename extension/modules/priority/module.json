@@ -1,0 +1,14 @@
+{
+  "id": "priority",
+  "name": "Priority — פתיחת מסמכים",
+  "version": "1.0.0",
+  "description": "פתיחת מסמכי-מקור של Priority Web (הזמנות, ספקים, חשבוניות) ממגדל בטאב-Priority משותף, ללא התחברות-מחדש — ניווט יזום-דפדפן ששולח את cookie-הסשן (SameSite=Strict) שקישור רגיל חוצה-אתר מאבד.",
+  "category": "erp",
+  "sku": "PRIORITY_001",
+  "author": "ARAD Team",
+  "host_permissions": [],
+  "content_scripts": [],
+  "handler": "modules/priority/handler.js",
+  "message_types": ["OPEN_PRIORITY"],
+  "storage_keys": []
+}

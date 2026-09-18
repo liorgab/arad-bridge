@@ -224,6 +224,77 @@ export const MODULES = {
       installer_size_mb: 250,
       check_url: 'http://127.0.0.1:8766/status'
     }
+  },
+
+  // ─── MPP Convert — MS Project (.mpp) → MSPDI XML via the daemon ─
+  mpp: {
+    id: 'mpp',
+    name: 'המרת לוז MS Project',
+    description: 'המרת קובץ MS Project (.mpp) ל-XML (MSPDI) דרך כלי MPXJ ב-Daemon, לצורך ייבוא לוז ב-TOWER. חינמי, מקומי, ללא ענן.',
+    icon: 'icons/module-mpp.svg',
+    version: '1.0.0',
+    category: 'documents',
+    sku: 'MPP_CONV_001',
+    required: false,
+
+    host_permissions: [
+      'http://127.0.0.1:8766/*',
+      'http://localhost:8766/*'
+    ],
+
+    // No content scripts — talks only to the local daemon over HTTP.
+    content_scripts: [],
+
+    handler: 'modules/mpp-convert/handler.js',
+    message_types: [
+      'MPP_CONVERT'
+    ],
+
+    api: [
+      { method: 'convertMppToXml', message: 'MPP_CONVERT' }
+    ],
+
+    requires_external: {
+      type: 'daemon',
+      name: 'ARAD Bulk Daemon',
+      port: 8766,
+      download_url: 'https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe',
+      installer_size_mb: 250,
+      check_url: 'http://127.0.0.1:8766/status'
+    }
+  },
+
+  // ─── Priority — open ERP source documents from TOWER ────────────
+  // Navigates the user's (shared) Priority Web tab via chrome.tabs — a
+  // browser-initiated navigation that carries Priority's SameSite=Strict
+  // session cookie, which a plain cross-site <a> click from TOWER loses
+  // (→ login bounce on every click). No daemon, no content script, no host
+  // permission needed (tabs API only).
+  priority: {
+    id: 'priority',
+    name: 'Priority — פתיחת מסמכים',
+    description: 'פתיחת מסמכי-מקור של Priority Web ממגדל בטאב-Priority משותף, ללא התחברות-מחדש בכל לחיצה.',
+    icon: 'icons/module-priority.svg',
+    version: '1.0.0',
+    category: 'erp',
+    sku: 'PRIORITY_001',
+    required: false,
+
+    host_permissions: [],
+
+    // No content scripts — only navigates a tab through the tabs API.
+    content_scripts: [],
+
+    handler: 'modules/priority/handler.js',
+    message_types: [
+      'OPEN_PRIORITY'
+    ],
+
+    api: [
+      { method: 'openPriority', message: 'OPEN_PRIORITY' }
+    ],
+
+    requires_external: null
   }
 };
 

@@ -52,6 +52,13 @@ const MODULE_CONFIG = {
     actionLabel: 'פתח Chrome Test לסריקת QR',
     actionClass: 'success',
     actionMessage: 'BULK_OPEN_WHATSAPP'
+  },
+  priority: {
+    title: 'Priority — פתיחת מסמכים',
+    emoji: '🏗️',
+    actionLabel: 'פתח את Priority',
+    actionClass: 'primary',
+    actionMessage: 'OPEN_PRIORITY'
   }
 };
 

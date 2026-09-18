@@ -104,6 +104,7 @@ RPC_TIMEOUT_DEFAULT = 30
 RPC_TIMEOUT_SEND = 120
 RPC_TIMEOUT_LOGIN = 200
 RPC_TIMEOUT_PDF = 60         # HTML→PDF render (headless Chrome first-launch + print)
+RPC_TIMEOUT_MPP = 60         # MPP→XML convert (MPXJ tool first-launch + parse)
 
 
 # ─── Logging ────────────────────────────────────────────────────────
@@ -923,6 +924,43 @@ def render_pdf():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e),
                         'error_code': 'RENDER_FAILED',
+                        'trace': traceback.format_exc()}), 500
+
+
+@app.route('/convert_mpp', methods=['POST'])
+def convert_mpp():
+    """Convert a binary MS Project (.mpp) file → MSPDI XML, via the MPXJ-based
+    `mpp2xml` tool (shelled out by the worker). Free, local, no cloud.
+
+    Request:  { mpp_base64: string }
+    Response: { success: true, xml_base64 } | { success: false, error, error_code }
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'bad json: {e}',
+                        'error_code': 'CONVERT_FAILED'}), 400
+
+    mpp_base64 = (data or {}).get('mpp_base64', '')
+    if not mpp_base64:
+        return jsonify({'success': False, 'error': 'empty mpp',
+                        'error_code': 'CONVERT_FAILED'}), 400
+
+    try:
+        result = worker.call({'cmd': 'convert_mpp', 'mpp_base64': mpp_base64},
+                             timeout=RPC_TIMEOUT_MPP)
+        if not result.get('success'):
+            return jsonify({'success': False,
+                            'error': result.get('error', 'convert failed'),
+                            'error_code': result.get('error_code', 'CONVERT_FAILED'),
+                            'trace': result.get('trace', '')}), 500
+        return jsonify({'success': True, 'xml_base64': result.get('xml_base64')})
+    except WorkerError as e:
+        code = 'TIMEOUT' if 'timeout' in str(e).lower() else 'CONVERT_FAILED'
+        return jsonify({'success': False, 'error': str(e), 'error_code': code}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e),
+                        'error_code': 'CONVERT_FAILED',
                         'trace': traceback.format_exc()}), 500
 
 

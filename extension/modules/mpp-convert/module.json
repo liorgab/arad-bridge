@@ -1,0 +1,26 @@
+{
+  "id": "mpp",
+  "name": "המרת לוז MS Project",
+  "version": "1.0.0",
+  "description": "המרת קובץ MS Project (.mpp) ל-XML (MSPDI) דרך כלי MPXJ ב-ARAD Bulk Daemon (פורט 8766). חינמי, מקומי, ללא ענן. משמש לייבוא לוז ב-TOWER.",
+  "category": "documents",
+  "sku": "MPP_CONV_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
+  ],
+  "content_scripts": [],
+  "handler": "modules/mpp-convert/handler.js",
+  "message_types": [
+    "MPP_CONVERT"
+  ],
+  "requires_external": {
+    "type": "daemon",
+    "name": "ARAD Bulk Daemon",
+    "port": 8766,
+    "check_url": "http://127.0.0.1:8766/status",
+    "download_url": "https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe",
+    "installer_size_mb": 250
+  }
+}

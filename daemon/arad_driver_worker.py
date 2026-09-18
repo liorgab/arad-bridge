@@ -72,6 +72,12 @@ DEFAULT_CHROMEDRIVER = os.path.join(
     os.environ.get('LOCALAPPDATA', tempfile.gettempdir()),
     'AradBulkDaemon', 'chromedriver.exe'
 )
+# MPXJ-based MS Project (.mpp) → MSPDI XML converter (self-contained .NET exe),
+# shipped alongside the daemon. Overridable via config.json "mpp2xml_path".
+DEFAULT_MPP2XML = os.path.join(
+    os.environ.get('LOCALAPPDATA', tempfile.gettempdir()),
+    'AradBulkDaemon', 'mpp2xml.exe'
+)
 CONFIG_FILE = os.path.join(
     os.environ.get('LOCALAPPDATA', tempfile.gettempdir()),
     'AradBulkDaemon', 'config.json'
@@ -117,6 +123,7 @@ CONFIG = load_config()
 CHROME_PATH = CONFIG.get('chrome_path', DEFAULT_CHROME_PATH)
 PROFILE_DIR = CONFIG.get('profile_dir', DEFAULT_PROFILE_DIR)
 CHROMEDRIVER_PATH = CONFIG.get('chromedriver_path', DEFAULT_CHROMEDRIVER)
+MPP2XML_PATH = CONFIG.get('mpp2xml_path', DEFAULT_MPP2XML)
 
 
 # ─── XPath / CSS Selectors (WA Blaster style) ───────────────────────
@@ -1514,6 +1521,50 @@ def cmd_render_pdf(req):
                 'trace': traceback.format_exc()}
 
 
+def cmd_convert_mpp(req):
+    """Convert a binary MS Project (.mpp) → MSPDI XML via the MPXJ `mpp2xml`
+    tool. Free + local (no cloud): decode base64 → temp .mpp → shell out to the
+    tool → read the XML → return it base64. Never touches the WhatsApp/PDF
+    drivers. Returns { success, xml_base64 } | { success:false, error, error_code }."""
+    import base64 as _b64
+    import shutil as _shutil
+    mpp_b64 = req.get('mpp_base64', '')
+    if not mpp_b64:
+        return {'ok': True, 'success': False, 'error': 'empty mpp', 'error_code': 'CONVERT_FAILED'}
+    if not os.path.exists(MPP2XML_PATH):
+        return {'ok': True, 'success': False,
+                'error': f'mpp2xml tool not found at {MPP2XML_PATH}',
+                'error_code': 'TOOL_MISSING'}
+    tmpdir = tempfile.mkdtemp(prefix='aradmpp_')
+    in_path = os.path.join(tmpdir, 'in.mpp')
+    out_path = os.path.join(tmpdir, 'out.xml')
+    try:
+        with open(in_path, 'wb') as f:
+            f.write(_b64.b64decode(mpp_b64))
+        proc = subprocess.run(
+            [MPP2XML_PATH, in_path, out_path],
+            capture_output=True, text=True, timeout=50,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            return {'ok': True, 'success': False,
+                    'error': (proc.stderr or proc.stdout or 'convert failed')[:400],
+                    'error_code': 'CONVERT_FAILED'}
+        with open(out_path, 'rb') as f:
+            xml_bytes = f.read()
+        log(f'converted MPP→XML: {len(xml_bytes)} bytes')
+        return {'ok': True, 'success': True,
+                'xml_base64': _b64.b64encode(xml_bytes).decode('ascii')}
+    except subprocess.TimeoutExpired:
+        return {'ok': True, 'success': False, 'error': 'mpp2xml timeout', 'error_code': 'TIMEOUT'}
+    except Exception as e:
+        log(f'convert_mpp failed: {e}')
+        return {'ok': True, 'success': False, 'error': str(e)[:300],
+                'error_code': 'CONVERT_FAILED', 'trace': traceback.format_exc()}
+    finally:
+        _shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def cmd_shutdown(req):
     shutdown_driver()
     shutdown_pdf_driver()
@@ -1529,6 +1580,7 @@ HANDLERS = {
     'prepare_bulk': cmd_prepare_bulk,
     'send_message': cmd_send_message,
     'render_pdf': cmd_render_pdf,
+    'convert_mpp': cmd_convert_mpp,
     'get_selectors': cmd_get_selectors,
     'set_selectors': cmd_set_selectors,
     'diagnostics': cmd_diagnostics,

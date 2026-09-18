@@ -19,7 +19,7 @@
     return;
   }
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.3.0';
   const TIMEOUT_MS = 60_000;
 
   // Local cache of enabled modules — refreshed on every handshake.
@@ -201,7 +201,22 @@
     // headless Chrome. Returns { success, pdf_base64 } | { success:false, error }.
     renderHtmlToPdf: gated('pdf', (html, options = null) =>
       sendRequest('PDF_RENDER', { payload: { html, options } })
-    )
+    ),
+
+    // ─── MPP Convert module ───────────────────────────────────
+    // Convert a binary MS Project .mpp (base64) → MSPDI XML (base64) via the
+    // daemon + MPXJ tool. Returns { success, xml_base64 } | { success:false, error }.
+    convertMppToXml: gated('mpp', (mppBase64) =>
+      sendRequest('MPP_CONVERT', { payload: { mpp_base64: mppBase64 } })
+    ),
+
+    // ─── Priority module ──────────────────────────────────────
+    // Open a Priority Web deep-link in the shared Priority tab through the
+    // chrome.tabs API. A browser-initiated navigation carries Priority's
+    // SameSite=Strict session cookie (a cross-site <a> click from the app
+    // does not) → the document opens without re-login.
+    // url must be https://p.priority-connect.online/...
+    openPriority: gated('priority', (url) => sendRequest('OPEN_PRIORITY', { url }))
   };
 
   // Freeze top-level (methods can still be called, but the object can't be mutated)
