@@ -216,7 +216,18 @@
     // SameSite=Strict session cookie (a cross-site <a> click from the app
     // does not) → the document opens without re-login.
     // url must be https://p.priority-connect.online/...
-    openPriority: gated('priority', (url) => sendRequest('OPEN_PRIORITY', { url }))
+    openPriority: gated('priority', (url) => sendRequest('OPEN_PRIORITY', { url })),
+
+    // ─── OneDrive module ──────────────────────────────────────
+    // Read-only browsing of the company's OneDrive/SharePoint through the
+    // session this browser already holds. `site` is the web root (a personal
+    // drive lives at https://<t>-my.sharepoint.com/personal/<upn>); `path` is
+    // the server-relative path under it. oneDriveFetch takes a signed URL
+    // ARAD issued and the bytes go straight there — never through this page.
+    oneDriveWhoami: gated('onedrive', (site) => sendRequest('ONEDRIVE_WHOAMI', { site })),
+    oneDriveList:   gated('onedrive', (site, path) => sendRequest('ONEDRIVE_LIST', { site, path })),
+    oneDriveFetch:  gated('onedrive', (site, path, upload_url, content_type) =>
+      sendRequest('ONEDRIVE_FETCH', { site, path, upload_url, content_type }))
   };
 
   // Freeze top-level (methods can still be called, but the object can't be mutated)

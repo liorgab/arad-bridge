@@ -49,6 +49,7 @@ import waBulkHandler,         { getHealth as waBulkHealth }   from './modules/wh
 import pdfHandler,            { getHealth as pdfHealth }      from './modules/pdf-render/handler.js';
 import mppHandler,            { getHealth as mppHealth }      from './modules/mpp-convert/handler.js';
 import priorityHandler,       { getHealth as priorityHealth } from './modules/priority/handler.js';
+import onedriveHandler,       { getHealth as onedriveHealth } from './modules/onedrive/handler.js';
 
 const HANDLERS = {
   piba:            pibaHandler,
@@ -57,7 +58,8 @@ const HANDLERS = {
   whatsapp_bulk:   waBulkHandler,
   pdf:             pdfHandler,
   mpp:             mppHandler,
-  priority:        priorityHandler
+  priority:        priorityHandler,
+  onedrive:        onedriveHandler
 };
 
 const HEALTH_CHECKS = {
@@ -67,7 +69,8 @@ const HEALTH_CHECKS = {
   whatsapp_bulk:   waBulkHealth,
   pdf:             pdfHealth,
   mpp:             mppHealth,
-  priority:        priorityHealth
+  priority:        priorityHealth,
+  onedrive:        onedriveHealth
 };
 
 function getHandler(moduleId) {

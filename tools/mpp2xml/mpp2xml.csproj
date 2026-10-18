@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Self-contained win-x64 build (no .NET install needed on the daemon
+       machine). net.sf.mpxj pulls IKVM, so NO Java runtime is required.
+       Build:  dotnet publish -c Release  (see README.md) -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>mpp2xml</AssemblyName>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <!-- Folder publish (NOT single-file): IKVM ships many managed assemblies
+         that don't reliably bundle into a single exe. Ship the whole publish
+         folder next to the daemon. -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="net.sf.mpxj" Version="12.1.1" />
+  </ItemGroup>
+
+</Project>

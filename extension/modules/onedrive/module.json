@@ -1,0 +1,17 @@
+{
+  "id": "onedrive",
+  "name": "OneDrive — מסמכי פרויקטים",
+  "version": "1.0.0",
+  "description": "שוטטות בתיקיות OneDrive/SharePoint של החברה ומשיכת מסמכי-פרויקט (הסכמי קבלנים, הצעות מחיר, היתרים) למגדל — דרך ההתחברות הקיימת בדפדפן, בלי רישום אפליקציה ובלי הרשאות ברמת-ארגון. קריאה בלבד.",
+  "category": "documents",
+  "sku": "ONEDRIVE_001",
+  "author": "ARAD Team",
+  "host_permissions": ["https://*.sharepoint.com/*"],
+  "handler": "modules/onedrive/handler.js",
+  "message_types": [
+    "ONEDRIVE_WHOAMI",
+    "ONEDRIVE_LIST",
+    "ONEDRIVE_FETCH"
+  ],
+  "storage_keys": ["onedrive_last_site", "onedrive_last_whoami"]
+}

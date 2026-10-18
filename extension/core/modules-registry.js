@@ -306,6 +306,45 @@ export const MODULES = {
     ],
 
     requires_external: null
+  },
+
+  // ─── OneDrive — company project documents ──────────────────────
+  // Rides the session the browser already holds (a work account, or the
+  // "anyone with the link" share this drive uses today). No Entra app
+  // registration, no admin consent, no secret — and therefore no credential
+  // of ours that could reach a drive its user cannot already see.
+  onedrive: {
+    id: 'onedrive',
+    name: 'OneDrive — מסמכי פרויקטים',
+    description: 'שוטטות בתיקיות OneDrive/SharePoint ומשיכת מסמכי-פרויקט למגדל, דרך ההתחברות הקיימת בדפדפן. קריאה בלבד.',
+    icon: 'icons/module-onedrive.svg',
+    version: '1.0.0',
+    category: 'documents',
+    sku: 'ONEDRIVE_001',
+    required: false,
+
+    host_permissions: [
+      'https://*.sharepoint.com/*'
+    ],
+
+    // No content script: the background fetches the REST API directly with
+    // credentials:'include'. Nothing needs to run inside the SharePoint page.
+    content_scripts: [],
+
+    handler: 'modules/onedrive/handler.js',
+    message_types: [
+      'ONEDRIVE_WHOAMI',
+      'ONEDRIVE_LIST',
+      'ONEDRIVE_FETCH'
+    ],
+
+    api: [
+      { method: 'oneDriveWhoami', message: 'ONEDRIVE_WHOAMI' },
+      { method: 'oneDriveList',   message: 'ONEDRIVE_LIST' },
+      { method: 'oneDriveFetch',  message: 'ONEDRIVE_FETCH' }
+    ],
+
+    requires_external: null
   }
 };
 
