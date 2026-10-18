@@ -86,7 +86,18 @@ async function whoami(site) {
 }
 
 // ─── LIST — folders and files at a path ───────────────────────────
+// A path that does not exist answers 200 with an EMPTY collection, exactly
+// like a folder that is empty. Caught on the first live run: asking for
+// "הסכמי קבלנים" returned success/0 while the real folder is spelled
+// "הסכמי קלבנים" — a typo on the drive that would have read as "this project
+// has no agreements". So existence is checked, and a missing folder says so.
 async function list({ site, path }) {
+  const ex = await spFetch(restPath(site, path, '/Exists'));
+  if (ex.ok) {
+    const j = await ex.json().catch(() => ({}));
+    const exists = (j && (j.value ?? j.Exists));
+    if (exists === false) return { success: false, error_code: 'NOT_FOUND', path };
+  }
   const [fRes, dRes] = await Promise.all([
     spFetch(restPath(site, path, "/Folders?$select=Name,ItemCount,TimeLastModified,ServerRelativeUrl&$top=500")),
     spFetch(restPath(site, path, "/Files?$select=Name,Length,TimeLastModified,ServerRelativeUrl,UniqueId&$top=500")),
