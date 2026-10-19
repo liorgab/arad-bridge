@@ -226,6 +226,9 @@
     // ARAD issued and the bytes go straight there — never through this page.
     oneDriveWhoami: gated('onedrive', (site) => sendRequest('ONEDRIVE_WHOAMI', { site })),
     oneDriveList:   gated('onedrive', (site, path) => sendRequest('ONEDRIVE_LIST', { site, path })),
+    // preview returns the bytes to the page (base64) and stores nothing —
+    // looking at a document is not importing it
+    oneDrivePreview: gated('onedrive', (site, path) => sendRequest('ONEDRIVE_PREVIEW', { site, path })),
     oneDriveFetch:  gated('onedrive', (site, path, upload_url, content_type) =>
       sendRequest('ONEDRIVE_FETCH', { site, path, upload_url, content_type }))
   };

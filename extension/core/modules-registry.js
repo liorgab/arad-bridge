@@ -335,12 +335,14 @@ export const MODULES = {
     message_types: [
       'ONEDRIVE_WHOAMI',
       'ONEDRIVE_LIST',
+      'ONEDRIVE_PREVIEW',
       'ONEDRIVE_FETCH'
     ],
 
     api: [
       { method: 'oneDriveWhoami', message: 'ONEDRIVE_WHOAMI' },
       { method: 'oneDriveList',   message: 'ONEDRIVE_LIST' },
+      { method: 'oneDrivePreview', message: 'ONEDRIVE_PREVIEW' },
       { method: 'oneDriveFetch',  message: 'ONEDRIVE_FETCH' }
     ],
 

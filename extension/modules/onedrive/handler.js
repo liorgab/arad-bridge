@@ -124,6 +124,43 @@ async function list({ site, path }) {
   return { success: true, path, folders, files, count: folders.length + files.length };
 }
 
+// ─── PREVIEW — the bytes back to the page, for looking only ───────
+// Lior, 19/10/26: "כפתור הצג … מציג ולא מושך". Viewing and importing are two
+// different decisions and the screen must not force the second to allow the
+// first — a person looking for the right contract should not leave five copies
+// of the wrong ones in ARAD's storage.
+//
+// So this one returns the bytes to the page as base64 and keeps NOTHING: no
+// upload, no storage row, no record. The page turns it into a blob URL for the
+// viewer and drops it when the modal closes. Capped well below the import
+// limit, because this crosses postMessage and a 60MB drawing would freeze the
+// tab — a file above the cap can still be imported, just not previewed.
+const PREVIEW_MAX = 15 * 1024 * 1024;
+
+async function previewFile({ site, path }) {
+  const p = String(path).replace(/'/g, "''");
+  const url = `${site}/_api/web/GetFileByServerRelativeUrl('${encodeURIComponent(p)}')/$value`;
+  const res = await spFetch(url, { headers: { Accept: '*/*' } });
+  if (!res.ok) return { success: false, error_code: 'HTTP_' + res.status, status: res.status };
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > PREVIEW_MAX) {
+    return { success: false, error_code: 'TOO_LARGE_TO_PREVIEW', size: buf.byteLength, max: PREVIEW_MAX };
+  }
+  // chunked, because String.fromCharCode(...bytes) on a 10MB file blows the
+  // argument limit and throws RangeError
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const CH = 8192;
+  for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode(...bytes.subarray(i, i + CH));
+  return {
+    success: true,
+    name: path.split('/').pop(),
+    size: buf.byteLength,
+    content_type: res.headers.get('content-type') || 'application/octet-stream',
+    base64: btoa(bin),
+  };
+}
+
 // ─── FETCH — one file, straight into ARAD's storage ───────────────
 // `upload_url` is a signed URL ARAD issued for exactly this object; the bridge
 // never learns an ARAD credential and never keeps the bytes.
@@ -173,6 +210,10 @@ export default async function onedriveHandler(type, payload = {}) {
       case 'ONEDRIVE_LIST':
         if (!underSite(payload.path)) return { success: false, error_code: 'PATH_OUTSIDE_SITE' };
         return await list({ site, path: payload.path });
+
+      case 'ONEDRIVE_PREVIEW':
+        if (!underSite(payload.path)) return { success: false, error_code: 'PATH_OUTSIDE_SITE' };
+        return await previewFile({ site, path: payload.path });
 
       case 'ONEDRIVE_FETCH':
         if (!underSite(payload.path)) return { success: false, error_code: 'PATH_OUTSIDE_SITE' };
