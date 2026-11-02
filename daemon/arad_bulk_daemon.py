@@ -106,6 +106,42 @@ RPC_TIMEOUT_LOGIN = 200
 RPC_TIMEOUT_PDF = 60         # HTML→PDF render (headless Chrome first-launch + print)
 RPC_TIMEOUT_MPP = 60         # MPP→XML convert (MPXJ tool first-launch + parse)
 
+# ─── Transcription (meeting-transcription module) ────────────────────
+# NOTE: there is deliberately no RPC timeout here. Transcription does NOT go
+# through the worker subprocess: RPC_TIMEOUT caps every worker call at 60s and
+# an hour of audio needs ~32 minutes, so the only possible shape is an async
+# job on its own thread. See the route for why it must also avoid _job_lock.
+TRANSCRIBE_MODEL_DEFAULT   = 'ivrit-ai/whisper-large-v3-turbo-ct2'
+TRANSCRIBE_COMPUTE_DEFAULT = 'int8'          # measured as supported on this CPU; no CUDA
+TRANSCRIBE_THREADS_DEFAULT = 20              # i7-13705H: 14 cores / 20 threads
+TRANSCRIBE_BEAM_DEFAULT    = 5               # Lior 30/10/26: resolution before speed
+TRANSCRIBE_VAD_DEFAULT     = False           # VAD merges 15 segments into 5 — see SPEC 2.5b
+TRANSCRIBE_MAX_BYTES       = 220 * 1024 * 1024
+TRANSCRIBE_WAV_MAX_BYTES   = 50 * 1024 * 1024
+
+# ─── Diarization (who spoke when) ───────────────────────────────────
+# Local, and it keeps NOTHING. The embeddings exist inside one process for one
+# file and are never written anywhere: the labels are indices within this
+# recording, so no voiceprint and no biometric database — SPEC §7.4.
+#
+# ⚠️ The measurement that governs this (30/10/26, 56.5-minute Hebrew episode):
+#   num_clusters = -1 (threshold 0.5)  →  24 speakers / 523 turns / 2.23x
+#   num_clusters = 3  (known)          →   3 speakers / 356 turns / 2.57x
+# Auto-clustering is not "slightly noisy", it is unusable past a couple of
+# minutes. So diarization runs ONLY with a known speaker count — which is what
+# the recorder's participant list is for (SPEC §3.1ב / §13.3). Without one we
+# skip rather than produce 24 labels nobody can attach a person to.
+#
+# And it costs about as much as the transcription itself: ~2.2-2.6x realtime on
+# this CPU against ~2.11x for whisper, so asking for speakers roughly DOUBLES
+# the wait. The caller is told, rather than discovering it.
+DIARIZE_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+DIARIZE_SEG_MODEL  = os.path.join(DIARIZE_DIR, 'sherpa-onnx-pyannote-segmentation-3-0', 'model.onnx')
+DIARIZE_EMB_MODEL  = os.path.join(DIARIZE_DIR, 'wespeaker_en_voxceleb_resnet34.onnx')
+DIARIZE_MIN_ON     = 0.3                     # ignore blips shorter than this
+DIARIZE_MIN_OFF    = 0.5                     # a pause shorter than this does not split a turn
+DIARIZE_MAX_SPEAKERS = 12                    # a meeting, not a conference
+
 
 # ─── Logging ────────────────────────────────────────────────────────
 def log(msg, *args):
@@ -385,6 +421,324 @@ def _resolve_attachment_to_path(attachment_meta, employee_idx, att_idx):
 
 # ─── Bulk job runner ────────────────────────────────────────────────
 _jobs = {}  # job_id -> { queue, thread, status }
+
+
+# ─── Transcription job runner ───────────────────────────────────────
+# One semaphore of its own, so two transcriptions don't thrash 20 threads
+# against each other — but NOT _job_lock, which serialises WhatsApp jobs.
+# A one-hour transcription must not hold the bulk sender hostage, and that is
+# the measured exit criterion for this route.
+_transcribe_sem = threading.BoundedSemaphore(1)
+_whisper_model = None
+_whisper_model_key = None
+_whisper_load_lock = threading.Lock()
+
+
+def _get_whisper(model, compute_type, threads):
+    """Load once, keep in memory. The model is 1.5GB on disk and ~5s to load;
+    reloading it per request would dominate short jobs and churn RAM."""
+    global _whisper_model, _whisper_model_key
+    key = (model, compute_type, threads)
+    with _whisper_load_lock:
+        if _whisper_model_key != key:
+            from faster_whisper import WhisperModel
+            log(f'loading whisper model {model} ({compute_type}, {threads} threads)')
+            t0 = time.time()
+            _whisper_model = WhisperModel(model, device='cpu',
+                                          compute_type=compute_type,
+                                          cpu_threads=threads)
+            _whisper_model_key = key
+            log(f'   model loaded in {time.time() - t0:.1f}s')
+        return _whisper_model
+
+
+def transcribe_available():
+    """Report capability without importing the (heavy) model."""
+    try:
+        import importlib.util
+        for mod in ('faster_whisper', 'ctranslate2', 'av'):
+            if importlib.util.find_spec(mod) is None:
+                return False, f'missing python module: {mod}'
+        import av
+        major = int(str(av.__version__).split('.')[0])
+        if major >= 19:
+            # faster-whisper 1.2.1 calls av.open(metadata_errors=...), which
+            # PyAV 19 removed, and its dependency has no upper bound. Every
+            # decode fails with TypeError. Measured 30/10/26.
+            return False, f'av {av.__version__} is too new — pin av<19 (av==18.1.0)'
+        return True, 'ready'
+    except Exception as e:
+        return False, str(e)
+
+
+def diarize_available():
+    """Report capability without loading the models (~34MB of ONNX)."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec('sherpa_onnx') is None:
+            return False, 'missing python module: sherpa_onnx'
+        for p in (DIARIZE_SEG_MODEL, DIARIZE_EMB_MODEL):
+            if not os.path.exists(p):
+                return False, f'missing model file: {os.path.basename(p)}'
+        return True, 'ready'
+    except Exception as e:
+        return False, str(e)
+
+
+def _diarize(audio, sample_rate, speakers, stop_event, on_progress=None):
+    """Return [{start, end, speaker}] for a known number of speakers.
+
+    `speakers` must be >= 2. There is no auto mode on purpose — see the comment
+    on DIARIZE_* above for the measurement that removed it.
+    """
+    import sherpa_onnx
+
+    cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=DIARIZE_SEG_MODEL),
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=DIARIZE_EMB_MODEL),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=int(speakers)),
+        min_duration_on=DIARIZE_MIN_ON,
+        min_duration_off=DIARIZE_MIN_OFF,
+    )
+    if not cfg.validate():
+        raise RuntimeError('diarization config did not validate — check the model paths')
+
+    sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
+    if sd.sample_rate != sample_rate:
+        # whisper decodes at 16k and so does pyannote-3.0; if that ever stops
+        # being true, resampling silently would corrupt every boundary
+        raise RuntimeError(f'diarization wants {sd.sample_rate}Hz, audio is {sample_rate}Hz')
+
+    def cb(processed, total, _arg=None):
+        if on_progress and total:
+            on_progress(100.0 * processed / total)
+        return 0 if not stop_event.is_set() else 1
+
+    try:
+        result = sd.process(audio, callback=cb).sort_by_start_time()
+    except TypeError:
+        # older sherpa builds take no callback — the work still happens
+        result = sd.process(audio).sort_by_start_time()
+
+    return [{'start': float(s.start), 'end': float(s.end), 'speaker': int(s.speaker)}
+            for s in result]
+
+
+def _assign_speakers(segments, turns):
+    """Give each transcript segment the speaker it overlaps most.
+
+    Whisper's segments and the diarizer's turns are cut on different criteria
+    and never line up, so the only honest join is by time overlap. A segment
+    that overlaps nothing (music, a cough between turns) keeps no label rather
+    than being forced onto the nearest speaker.
+    """
+    if not turns:
+        return 0
+    labelled = 0
+    j = 0
+    for seg in segments:
+        s0, s1 = seg['from_ms'] / 1000.0, seg['to_ms'] / 1000.0
+        # turns are sorted, so walk the pointer forward instead of rescanning
+        while j < len(turns) and turns[j]['end'] <= s0:
+            j += 1
+        best, best_ov = None, 0.0
+        k = j
+        while k < len(turns) and turns[k]['start'] < s1:
+            ov = min(s1, turns[k]['end']) - max(s0, turns[k]['start'])
+            if ov > best_ov:
+                best_ov, best = ov, turns[k]['speaker']
+            k += 1
+        if best is not None:
+            seg['speaker_label'] = f'דובר {best + 1}'
+            labelled += 1
+    return labelled
+
+
+def run_transcribe_job(job_id, audio_path, opts, stop_event):
+    """Transcribe one audio file and stream progress onto the job queue.
+
+    Emits: started → progress* → complete | stopped | error
+    The full transcript is kept on the job dict for GET /transcribe/result/<id>,
+    because an hour of meeting audio is far too much to push through SSE.
+    """
+    q = _jobs[job_id]['queue']
+
+    def emit(ev):
+        try:
+            q.put_nowait(ev)
+        except Exception:
+            pass
+
+    try:
+        from faster_whisper import decode_audio
+
+        t_decode = time.time()
+        audio = decode_audio(audio_path, sampling_rate=16000)
+        audio_sec = len(audio) / 16000.0
+        decode_sec = time.time() - t_decode
+
+        emit({'type': 'started', 'job_id': job_id,
+              'audio_sec': round(audio_sec, 1),
+              'decode_sec': round(decode_sec, 1),
+              'model': opts['model'], 'beam_size': opts['beam_size'],
+              'vad': opts['vad']})
+
+        model = _get_whisper(opts['model'], opts['compute_type'], opts['threads'])
+
+        # language is passed explicitly and always: the ivrit.ai fine-tune
+        # degraded Whisper's own language detection, so relying on it is a bug.
+        t0 = time.time()
+        seg_iter, info = model.transcribe(
+            audio,
+            language=opts['language'],
+            beam_size=opts['beam_size'],
+            vad_filter=opts['vad'],
+            word_timestamps=False,
+        )
+
+        segments = []
+        last_emit = 0.0
+        stopped = False
+        for s in seg_iter:          # the generator is where the work happens
+            if stop_event.is_set():
+                stopped = True
+                break
+            segments.append({
+                'idx': len(segments),
+                'from_ms': int(round(s.start * 1000)),
+                'to_ms': int(round(s.end * 1000)),
+                'text': (s.text or '').strip(),
+                'confidence': (round(float(s.avg_logprob), 4)
+                               if getattr(s, 'avg_logprob', None) is not None else None),
+            })
+            now = time.time()
+            if now - last_emit >= 1.0:
+                last_emit = now
+                done = s.end
+                ev = {'type': 'progress', 'job_id': job_id,
+                      'stage': 'transcribing',
+                      'segments': len(segments),
+                      'audio_done_sec': round(done, 1),
+                      'audio_sec': round(audio_sec, 1),
+                      'pct': (round(100.0 * done / audio_sec, 1) if audio_sec else None),
+                      'elapsed_sec': round(now - t0, 1)}
+                # Kept on the job as well as emitted: an MV3 service worker
+                # cannot hold an EventSource reliably, so the bridge polls
+                # GET /transcribe/status/<id> instead of reading the SSE stream.
+                _jobs[job_id]['progress'] = ev
+                emit(ev)
+
+        process_ms = int(round((time.time() - t0) * 1000))
+
+        if stopped:
+            _jobs[job_id]['status'] = 'stopped'
+            emit({'type': 'stopped', 'job_id': job_id, 'segments': len(segments)})
+            return
+
+        # ── who spoke when ──────────────────────────────────────────
+        # Only with a known count, and the reason is measured, not stylistic:
+        # auto-clustering gave 24 labels on a 56-minute file. Everything here
+        # is best-effort — a diarization failure must never lose a transcript
+        # that already cost half an hour of CPU.
+        diar = {'requested': int(opts.get('speakers') or 0), 'ran': False,
+                'speakers': None, 'turns': None, 'labelled': 0,
+                'process_ms': None, 'skipped': None}
+        want = diar['requested']
+        if want and want >= 2 and segments and not stop_event.is_set():
+            ok, why = diarize_available()
+            if not ok:
+                diar['skipped'] = why
+                log(f'transcribe {job_id}: diarization skipped — {why}')
+            else:
+                try:
+                    # stored, not only emitted: the first sherpa callback can be
+                    # tens of seconds away, and until then a poller would still
+                    # read the transcription's last pct and think it hung at 98%
+                    ev0 = {'type': 'progress', 'job_id': job_id, 'stage': 'diarizing',
+                           'pct': 0.0, 'segments': len(segments),
+                           'audio_sec': round(audio_sec, 1)}
+                    _jobs[job_id]['progress'] = ev0
+                    emit(ev0)
+                    td = time.time()
+                    last_d = [0.0]
+
+                    def d_progress(pct):
+                        now = time.time()
+                        if now - last_d[0] >= 1.0:
+                            last_d[0] = now
+                            ev = {'type': 'progress', 'job_id': job_id,
+                                  'stage': 'diarizing', 'pct': round(pct, 1),
+                                  'segments': len(segments),
+                                  'audio_sec': round(audio_sec, 1),
+                                  'elapsed_sec': round(now - td, 1)}
+                            _jobs[job_id]['progress'] = ev
+                            emit(ev)
+
+                    turns = _diarize(audio, 16000, want, stop_event, d_progress)
+                    diar['labelled'] = _assign_speakers(segments, turns)
+                    diar['turns'] = len(turns)
+                    diar['speakers'] = len({t['speaker'] for t in turns})
+                    diar['process_ms'] = int(round((time.time() - td) * 1000))
+                    diar['ran'] = True
+                    log(f'transcribe {job_id}: diarized into {diar["speakers"]} speakers '
+                        f'({diar["turns"]} turns, {diar["labelled"]}/{len(segments)} segments '
+                        f'labelled) in {diar["process_ms"]/1000:.0f}s')
+                except Exception as e:
+                    # the transcript is the product; speaker labels are an extra
+                    diar['skipped'] = str(e)
+                    log(f'transcribe {job_id}: diarization FAILED (transcript kept): {e}')
+                    log(traceback.format_exc())
+        elif want and want < 2:
+            diar['skipped'] = 'צריך לפחות שני משתתפים כדי להפריד דוברים'
+
+        result = {
+            'job_id': job_id,
+            'language': opts['language'],
+            'engine': 'faster-whisper',
+            'diarization': diar,
+            'model_version': opts['model'],
+            'compute_type': opts['compute_type'],
+            'beam_size': opts['beam_size'],
+            'vad_filter': opts['vad'],
+            'audio_sec': round(audio_sec, 2),
+            'process_ms': process_ms,
+            'x_realtime': (round(audio_sec / (process_ms / 1000.0), 2) if process_ms else None),
+            'segments_count': len(segments),
+            'text': ' '.join(s['text'] for s in segments).strip(),
+            'segments': segments,
+        }
+        _jobs[job_id]['result'] = result
+        _jobs[job_id]['status'] = 'complete'
+        emit({'type': 'complete', 'job_id': job_id,
+              'segments_count': len(segments),
+              'diarization': diar,
+              'process_ms': process_ms,
+              'audio_sec': result['audio_sec'],
+              'x_realtime': result['x_realtime'],
+              'result_url': f'/transcribe/result/{job_id}'})
+        log(f'transcribe {job_id}: {audio_sec:.0f}s audio in {process_ms/1000:.0f}s '
+            f'({result["x_realtime"]}x realtime, {len(segments)} segments)')
+
+    except Exception as e:
+        _jobs[job_id]['status'] = 'failed'
+        _jobs[job_id]['error'] = str(e)
+        log(f'transcribe {job_id} FAILED: {e}')
+        log(traceback.format_exc())
+        # status + detail travel all the way to the message on screen: a screen
+        # that prints a bare code charges the price on every iteration.
+        emit({'type': 'error', 'job_id': job_id,
+              'error_code': 'TRANSCRIBE_FAILED',
+              'message': str(e)})
+    finally:
+        try:
+            if _jobs[job_id].get('cleanup_path'):
+                os.unlink(_jobs[job_id]['cleanup_path'])
+        except Exception:
+            pass
+        _transcribe_sem.release()
 
 
 def run_bulk_job(job_id, employees, template, attachment_path,
@@ -667,12 +1021,28 @@ def status():
     except Exception:
         pass
 
+    tr_ok, tr_why = transcribe_available()
+    di_ok, di_why = diarize_available()
     return jsonify({
         'daemon': 'running',
         'version': '1.0.0',
         'driver_alive': driver_alive,
         'wa_logged_in': logged_in,
         'active_jobs': [jid for jid, j in _jobs.items() if j['status'] == 'running'],
+        'transcribe': {
+            'available': tr_ok,
+            'detail': tr_why,
+            'model': TRANSCRIBE_MODEL_DEFAULT,
+            'model_loaded': _whisper_model is not None,
+            'busy': any(j.get('kind') == 'transcribe' and j['status'] == 'running'
+                        for j in _jobs.values()),
+        },
+        'diarize': {
+            'available': di_ok,
+            'detail': di_why,
+            'needs_speaker_count': True,   # there is no auto mode — see DIARIZE_*
+            'max_speakers': DIARIZE_MAX_SPEAKERS,
+        },
         'config': {
             'chrome_path': CHROME_PATH,
             'profile_dir': PROFILE_DIR,
@@ -962,6 +1332,171 @@ def convert_mpp():
         return jsonify({'success': False, 'error': str(e),
                         'error_code': 'CONVERT_FAILED',
                         'trace': traceback.format_exc()}), 500
+
+
+@app.route('/transcribe', methods=['POST'])
+def transcribe():
+    """Start an async Hebrew transcription job. Returns {job_id} immediately.
+
+    Request:  { audio_base64 | audio_path, filename?, language?, beam_size?,
+                vad?, model?, compute_type?, threads? }
+    Response: { success: true, job_id, sse_url, result_url }
+
+    Why this route does NOT look like /convert_mpp or /render_pdf, which both
+    shell out through worker.call: that path is capped by RPC_TIMEOUT (60s) and
+    serialised by the worker's single lock, so a one-hour transcription would
+    both time out and block bulk WhatsApp sending for half an hour. This route
+    owns its thread, takes only its own semaphore, and reuses the existing
+    /progress and /stop endpoints rather than inventing a second mechanism.
+    """
+    ok, why = transcribe_available()
+    if not ok:
+        return jsonify({'success': False, 'error': why,
+                        'error_code': 'TRANSCRIBE_UNAVAILABLE'}), 503
+
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'bad json: {e}',
+                        'error_code': 'BAD_REQUEST'}), 400
+
+    audio_b64 = data.get('audio_base64') or ''
+    audio_path = data.get('audio_path') or ''
+    filename = os.path.basename(str(data.get('filename') or 'audio'))
+    cleanup_path = None
+
+    if not audio_b64 and not audio_path:
+        return jsonify({'success': False, 'error': 'audio_base64 or audio_path required',
+                        'error_code': 'BAD_REQUEST'}), 400
+
+    if audio_b64:
+        try:
+            raw = base64.b64decode(audio_b64)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'bad base64: {e}',
+                            'error_code': 'BAD_REQUEST'}), 400
+        if len(raw) > TRANSCRIBE_MAX_BYTES:
+            return jsonify({'success': False,
+                            'error': f'audio is {len(raw) // (1024*1024)}MB; '
+                                     f'the limit is {TRANSCRIBE_MAX_BYTES // (1024*1024)}MB',
+                            'error_code': 'AUDIO_TOO_LARGE'}), 413
+        # The compressed source passes; raw WAV never does. Two hours of 16kHz
+        # mono WAV is 230MB (307MB once base64'd) against 22MB of Opus, and the
+        # daemon decodes locally anyway — so sending WAV buys nothing.
+        if filename.lower().endswith('.wav') and len(raw) > TRANSCRIBE_WAV_MAX_BYTES:
+            return jsonify({'success': False,
+                            'error': 'send the compressed source (m4a/opus/mp3), not WAV — '
+                                     'the daemon decodes locally, so WAV only inflates the upload',
+                            'error_code': 'WAV_NOT_ACCEPTED'}), 413
+        try:
+            tmp_dir = os.path.join(tempfile.gettempdir(), 'arad_transcribe')
+            os.makedirs(tmp_dir, exist_ok=True)
+            ext = os.path.splitext(filename)[1] or '.bin'
+            cleanup_path = os.path.join(tmp_dir, f'{int(time.time() * 1000)}{ext}')
+            with open(cleanup_path, 'wb') as f:
+                f.write(raw)
+            audio_path = cleanup_path
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'could not save audio: {e}',
+                            'error_code': 'TRANSCRIBE_FAILED'}), 500
+    elif not os.path.isfile(audio_path):
+        return jsonify({'success': False, 'error': f'no such file: {audio_path}',
+                        'error_code': 'AUDIO_NOT_FOUND'}), 404
+
+    if not _transcribe_sem.acquire(blocking=False):
+        return jsonify({'success': False,
+                        'error': 'a transcription is already running',
+                        'error_code': 'TRANSCRIBE_BUSY',
+                        'active_jobs': [jid for jid, j in _jobs.items()
+                                        if j.get('kind') == 'transcribe'
+                                        and j['status'] == 'running']}), 409
+
+    opts = {
+        'language':     str(data.get('language') or 'he'),
+        'model':        str(data.get('model') or TRANSCRIBE_MODEL_DEFAULT),
+        'compute_type': str(data.get('compute_type') or TRANSCRIBE_COMPUTE_DEFAULT),
+        'threads':      int(data.get('threads') or TRANSCRIBE_THREADS_DEFAULT),
+        'beam_size':    int(data.get('beam_size') or TRANSCRIBE_BEAM_DEFAULT),
+        'vad':          bool(data.get('vad', TRANSCRIBE_VAD_DEFAULT)),
+        # 0 / missing = no diarization. There is no "auto" — a count comes from
+        # the participant list or it does not happen (see DIARIZE_* above).
+        'speakers':     max(0, min(DIARIZE_MAX_SPEAKERS, int(data.get('speakers') or 0))),
+    }
+
+    job_id = f'tr_{int(time.time() * 1000)}'
+    stop_event = threading.Event()
+    _jobs[job_id] = {
+        'queue': queue.Queue(maxsize=5000),
+        'status': 'running',
+        'kind': 'transcribe',
+        'stop_event': stop_event,
+        'pause_event': None,
+        'total': 0,
+        'started_at': time.time(),
+        'cleanup_path': cleanup_path,
+    }
+
+    t = threading.Thread(target=run_transcribe_job,
+                         args=(job_id, audio_path, opts, stop_event),
+                         daemon=True)
+    _jobs[job_id]['thread'] = t
+    t.start()
+
+    log(f'transcribe job {job_id} started: {audio_path} '
+        f'(beam {opts["beam_size"]}, vad {opts["vad"]}, {opts["threads"]} threads)')
+    return jsonify({'success': True, 'job_id': job_id,
+                    'sse_url': f'/progress/{job_id}',
+                    'result_url': f'/transcribe/result/{job_id}',
+                    'options': opts})
+
+
+@app.route('/transcribe/status/<job_id>', methods=['GET'])
+def transcribe_status(job_id):
+    """Poll-friendly snapshot of one transcription job.
+
+    The SSE stream at /progress/<id> stays the canonical progress channel, but
+    an MV3 service worker cannot keep an EventSource alive across its own
+    suspension, so the bridge polls this instead. Same state, different read.
+    """
+    job = _jobs.get(job_id)
+    if not job or job.get('kind') != 'transcribe':
+        return jsonify({'success': False, 'error': 'unknown job_id',
+                        'error_code': 'JOB_NOT_FOUND'}), 404
+    prog = job.get('progress') or {}
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': job['status'],
+        'error': job.get('error') or None,
+        'elapsed_sec': round(time.time() - job['started_at'], 1),
+        # which pass is running: diarization is a SECOND pass of similar cost,
+        # so a client that doesn't say so looks stuck at 100% for half the wait
+        'stage': prog.get('stage', 'transcribing'),
+        'segments': prog.get('segments', 0),
+        'audio_sec': prog.get('audio_sec'),
+        'audio_done_sec': prog.get('audio_done_sec'),
+        'pct': prog.get('pct'),
+        'result_url': (f'/transcribe/result/{job_id}'
+                       if job['status'] == 'complete' else None),
+    })
+
+
+@app.route('/transcribe/result/<job_id>', methods=['GET'])
+def transcribe_result(job_id):
+    """The finished transcript, segments included. Separate from the SSE stream
+    because an hour of meeting audio is far too much to push through it."""
+    job = _jobs.get(job_id)
+    if not job or job.get('kind') != 'transcribe':
+        return jsonify({'success': False, 'error': 'unknown job_id',
+                        'error_code': 'JOB_NOT_FOUND'}), 404
+    if job['status'] == 'running':
+        return jsonify({'success': False, 'status': 'running',
+                        'error_code': 'JOB_RUNNING'}), 409
+    if job['status'] != 'complete':
+        return jsonify({'success': False, 'status': job['status'],
+                        'error': job.get('error', ''),
+                        'error_code': 'JOB_NOT_COMPLETE'}), 409
+    return jsonify({'success': True, **job['result']})
 
 
 @app.route('/selectors', methods=['GET'])

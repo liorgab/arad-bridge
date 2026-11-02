@@ -3,3 +3,22 @@ flask>=3.0.0
 flask-cors>=4.0.0
 requests>=2.31.0
 pyperclip>=1.8.2
+
+# ─── meeting transcription (optional) ────────────────────────────────
+# The daemon runs fine without these: transcribe_available() reports what is
+# missing and the module simply stays unavailable. Install them to enable it.
+faster-whisper==1.2.1
+# ⚠️ av MUST stay below 19 and faster-whisper does NOT cap it (it asks for
+# av>=11). PyAV 19 removed the `metadata_errors` argument that
+# faster_whisper/audio.py passes to av.open(), so with av>=19 EVERY decode
+# fails with TypeError. Measured 30/10/26 — do not relax this pin.
+av==18.1.0
+
+# ─── speaker diarization (optional, on top of the above) ─────────────
+# Also needs two ONNX models under <daemon dir>/models/ — about 34MB, not in
+# git. diarize_available() names the missing file if they are absent.
+#   models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx
+#   models/wespeaker_en_voxceleb_resnet34.onnx
+# Both from github.com/k2-fsa/sherpa-onnx releases (segmentation is
+# MIT-licensed pyannote 3.0 exported to ONNX).
+sherpa-onnx==2.0.1

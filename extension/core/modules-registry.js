@@ -264,6 +264,53 @@ export const MODULES = {
     }
   },
 
+  // ─── Transcribe — Hebrew meeting transcription via the daemon ───
+  // Not request/response like pdf/mpp: an hour of audio is ~32 minutes of
+  // CPU (measured 30/10/26), so the contract is a job — start, poll, fetch.
+  // The audio never leaves the machine.
+  transcribe: {
+    id: 'transcribe',
+    name: 'תמלול ישיבות',
+    description: 'תמלול הקלטות בעברית ב-Daemon דרך faster-whisper + ivrit-ai/whisper-large-v3-turbo-ct2. מקומי לחלוטין — האודיו אינו יוצא מהמחשב. ~32 דקות עיבוד לשעת אודיו (נמדד).',
+    icon: 'icons/module-transcribe.svg',
+    version: '1.0.0',
+    category: 'documents',
+    sku: 'TRANSCRIBE_001',
+    required: false,
+
+    host_permissions: [
+      'http://127.0.0.1:8766/*',
+      'http://localhost:8766/*'
+    ],
+
+    // No content scripts — talks only to the local daemon over HTTP.
+    content_scripts: [],
+
+    handler: 'modules/transcribe/handler.js',
+    message_types: [
+      'TRANSCRIBE_START',
+      'TRANSCRIBE_STATUS',
+      'TRANSCRIBE_RESULT',
+      'TRANSCRIBE_STOP'
+    ],
+
+    api: [
+      { method: 'startTranscription',     message: 'TRANSCRIBE_START' },
+      { method: 'getTranscriptionStatus', message: 'TRANSCRIBE_STATUS' },
+      { method: 'getTranscriptionResult', message: 'TRANSCRIBE_RESULT' },
+      { method: 'stopTranscription',      message: 'TRANSCRIBE_STOP' }
+    ],
+
+    requires_external: {
+      type: 'daemon',
+      name: 'ARAD Bulk Daemon',
+      port: 8766,
+      download_url: 'https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe',
+      installer_size_mb: 250,
+      check_url: 'http://127.0.0.1:8766/status'
+    }
+  },
+
   // ─── Priority — open ERP source documents from TOWER ────────────
   // Navigates the user's (shared) Priority Web tab via chrome.tabs — a
   // browser-initiated navigation that carries Priority's SameSite=Strict

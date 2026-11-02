@@ -29,25 +29,15 @@ $DAEMON_SRC  = Join-Path $REPO_ROOT "daemon\arad_bulk_daemon.py"
 
 # --- 1. Verify Python is installed (reuse from D.Yohai) ---
 Write-Host "[1/7] Verifying Python..." -ForegroundColor Yellow
-$pyCandidates = @(
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
-    "C:\Python313\python.exe",
-    "C:\Python312\python.exe",
-    "C:\Program Files\Python313\python.exe",
-    "C:\Program Files\Python312\python.exe"
-)
-$pyExe = $pyCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $pyExe) {
-    try { $pyExe = (Get-Command python -ErrorAction Stop).Source } catch {}
-}
+# One shared finder, newest-first - see installer\_find_python.ps1 for why the
+# old hard-coded 3.13/3.12/3.11 list was a trap on a machine that runs 3.14.
+. "$PSScriptRoot\_find_python.ps1"
+$pyExe = Find-AradPython
 if (-not $pyExe) {
     Write-Host "  [X] Python not found." -ForegroundColor Red
     Write-Host "      Install Python 3.11+ first (e.g., from D.Yohai installer)." -ForegroundColor Red
     exit 1
 }
-Write-Host "  [OK] Python: $pyExe" -ForegroundColor Green
 
 # Check required packages
 $pkgsOk = & $pyExe -c "import selenium, flask, flask_cors, requests, pyperclip; print('OK')" 2>&1

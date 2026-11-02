@@ -210,6 +210,29 @@
       sendRequest('MPP_CONVERT', { payload: { mpp_base64: mppBase64 } })
     ),
 
+    // ─── Transcribe module ────────────────────────────────────
+    // A job, not a call: an hour of audio is ~32 minutes of CPU, so start
+    // returns a job_id and the caller polls. Defaults (beam 5, no VAD, int8,
+    // language he) live in the daemon so a caller cannot silently weaken them.
+    //   startTranscription({ audio_base64 | audio_path, filename? })
+    //     → { success, job_id, sse_url, result_url, options }
+    //   getTranscriptionStatus(jobId)
+    //     → { success, status, pct, segments, elapsed_sec }
+    //   getTranscriptionResult(jobId)
+    //     → { success, text, segments[], process_ms, x_realtime, … }
+    startTranscription: gated('transcribe', (payload) =>
+      sendRequest('TRANSCRIBE_START', { payload })
+    ),
+    getTranscriptionStatus: gated('transcribe', (jobId) =>
+      sendRequest('TRANSCRIBE_STATUS', { payload: { job_id: jobId } })
+    ),
+    getTranscriptionResult: gated('transcribe', (jobId) =>
+      sendRequest('TRANSCRIBE_RESULT', { payload: { job_id: jobId } })
+    ),
+    stopTranscription: gated('transcribe', (jobId) =>
+      sendRequest('TRANSCRIBE_STOP', { payload: { job_id: jobId } })
+    ),
+
     // ─── Priority module ──────────────────────────────────────
     // Open a Priority Web deep-link in the shared Priority tab through the
     // chrome.tabs API. A browser-initiated navigation carries Priority's

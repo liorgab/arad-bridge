@@ -50,6 +50,7 @@ import pdfHandler,            { getHealth as pdfHealth }      from './modules/pd
 import mppHandler,            { getHealth as mppHealth }      from './modules/mpp-convert/handler.js';
 import priorityHandler,       { getHealth as priorityHealth } from './modules/priority/handler.js';
 import onedriveHandler,       { getHealth as onedriveHealth } from './modules/onedrive/handler.js';
+import transcribeHandler,     { getHealth as transcribeHealth } from './modules/transcribe/handler.js';
 
 const HANDLERS = {
   piba:            pibaHandler,
@@ -59,7 +60,8 @@ const HANDLERS = {
   pdf:             pdfHandler,
   mpp:             mppHandler,
   priority:        priorityHandler,
-  onedrive:        onedriveHandler
+  onedrive:        onedriveHandler,
+  transcribe:      transcribeHandler
 };
 
 const HEALTH_CHECKS = {
@@ -70,7 +72,8 @@ const HEALTH_CHECKS = {
   pdf:             pdfHealth,
   mpp:             mppHealth,
   priority:        priorityHealth,
-  onedrive:        onedriveHealth
+  onedrive:        onedriveHealth,
+  transcribe:      transcribeHealth
 };
 
 function getHandler(moduleId) {

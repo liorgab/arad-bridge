@@ -1,0 +1,29 @@
+{
+  "id": "transcribe",
+  "name": "תמלול ישיבות",
+  "version": "1.0.0",
+  "description": "תמלול הקלטות בעברית דרך faster-whisper + ivrit-ai/whisper-large-v3-turbo-ct2 ב-ARAD Bulk Daemon (פורט 8766). מקומי לחלוטין — האודיו אינו יוצא מהמחשב. נמדד 30/10/26: 1.89× realtime על CPU, כלומר ~32 דקות עיבוד לשעת אודיו.",
+  "category": "documents",
+  "sku": "TRANSCRIBE_001",
+  "author": "ARAD Team",
+  "host_permissions": [
+    "http://127.0.0.1:8766/*",
+    "http://localhost:8766/*"
+  ],
+  "content_scripts": [],
+  "handler": "modules/transcribe/handler.js",
+  "message_types": [
+    "TRANSCRIBE_START",
+    "TRANSCRIBE_STATUS",
+    "TRANSCRIBE_RESULT",
+    "TRANSCRIBE_STOP"
+  ],
+  "requires_external": {
+    "type": "daemon",
+    "name": "ARAD Bulk Daemon",
+    "port": 8766,
+    "check_url": "http://127.0.0.1:8766/status",
+    "download_url": "https://github.com/liorgab/arad-bridge/releases/latest/arad-bulk-daemon-setup.exe",
+    "installer_size_mb": 250
+  }
+}
