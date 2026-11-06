@@ -59,6 +59,7 @@ import threading
 import tempfile
 import traceback
 import subprocess
+import urllib.request
 
 try:
     from flask import Flask, request, jsonify, Response, stream_with_context
@@ -118,6 +119,7 @@ TRANSCRIBE_BEAM_DEFAULT    = 5               # Lior 30/10/26: resolution before 
 TRANSCRIBE_VAD_DEFAULT     = False           # VAD merges 15 segments into 5 — see SPEC 2.5b
 TRANSCRIBE_MAX_BYTES       = 220 * 1024 * 1024
 TRANSCRIBE_WAV_MAX_BYTES   = 50 * 1024 * 1024
+TRANSCRIBE_FETCH_TIMEOUT   = 300             # seconds, for an audio URL (see /transcribe)
 
 # ─── Diarization (who spoke when) ───────────────────────────────────
 # Local, and it keeps NOTHING. The embeddings exist inside one process for one
@@ -1399,6 +1401,54 @@ def transcribe():
         except Exception as e:
             return jsonify({'success': False, 'error': f'could not save audio: {e}',
                             'error_code': 'TRANSCRIBE_FAILED'}), 500
+    elif audio_path.lower().startswith(('http://', 'https://')):
+        # A URL, not a path — the caller already put the audio somewhere the
+        # daemon can reach, so it fetches the bytes itself instead of being
+        # handed them.
+        #
+        # ⛔ WHY THIS EXISTS, measured 04/11/26 in production: the browser was
+        # sending the audio as base64 through the extension, and
+        # `chrome.runtime.sendMessage` refuses anything over **64MiB**. A
+        # 55.2MB meeting is 73.6MB once base64'd, so the most ordinary case —
+        # an hour of audio — could not pass at all. Nothing was tunable about
+        # it; 64MiB is Chrome's hard ceiling.
+        #
+        # And the bytes were already in storage, uploaded moments earlier. The
+        # browser was shipping them a second time, through the narrowest pipe
+        # in the chain, to a daemon that can simply download them. A short
+        # signed URL carries the same audio in ~200 bytes of message.
+        #
+        # The ceiling that still applies is TRANSCRIBE_MAX_BYTES, enforced
+        # here while streaming so a wrong URL cannot fill the disk.
+        try:
+            tmp_dir = os.path.join(tempfile.gettempdir(), 'arad_transcribe')
+            os.makedirs(tmp_dir, exist_ok=True)
+            ext = os.path.splitext(filename)[1] or '.bin'
+            cleanup_path = os.path.join(tmp_dir, f'{int(time.time() * 1000)}{ext}')
+            got = 0
+            req = urllib.request.Request(audio_path, headers={'User-Agent': 'ARAD-Bulk-Daemon'})
+            with urllib.request.urlopen(req, timeout=TRANSCRIBE_FETCH_TIMEOUT) as resp, \
+                 open(cleanup_path, 'wb') as f:
+                while True:
+                    block = resp.read(1024 * 1024)
+                    if not block:
+                        break
+                    got += len(block)
+                    if got > TRANSCRIBE_MAX_BYTES:
+                        raise ValueError(f'audio exceeds {TRANSCRIBE_MAX_BYTES // (1024*1024)}MB')
+                    f.write(block)
+            if got == 0:
+                raise ValueError('downloaded 0 bytes')
+            audio_path = cleanup_path
+        except Exception as e:
+            try:
+                if cleanup_path and os.path.isfile(cleanup_path):
+                    os.remove(cleanup_path)
+            except Exception:
+                pass
+            return jsonify({'success': False,
+                            'error': f'could not fetch audio: {e}',
+                            'error_code': 'AUDIO_FETCH_FAILED'}), 502
     elif not os.path.isfile(audio_path):
         return jsonify({'success': False, 'error': f'no such file: {audio_path}',
                         'error_code': 'AUDIO_NOT_FOUND'}), 404
